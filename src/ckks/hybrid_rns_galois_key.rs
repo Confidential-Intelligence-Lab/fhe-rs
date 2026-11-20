@@ -173,6 +173,11 @@ impl PreparedHybridRnsGaloisKey {
         self.exponent
     }
 
+    /// Polynomial ring degree associated with this prepared key.
+    pub fn degree(&self) -> usize {
+        self.degree
+    }
+
     // R36_8G_2C_1_KEY_PAYLOAD_ACCOUNTING
     /// Logical NTT coefficient payload retained by this prepared key.
     ///

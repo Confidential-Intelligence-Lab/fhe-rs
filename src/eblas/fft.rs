@@ -17,8 +17,8 @@ use crate::ckks::{
     rotate_right_bounded_rns_ckks_with_prepared_execution,
     rotate_right_hybrid_rns_ckks_with_prepared_ntt, rotate_right_rns_ckks_with_prepared_ntt,
     rotation_exponent_left, rotation_exponent_right, CkksCanonicalEmbedding,
-    PreparedBoundedRnsGaloisKey, PreparedHybridRnsGaloisKey, PreparedRnsGaloisKey,
-    RnsCkksCiphertext, RnsCkksEvaluator,
+    PreparedBoundedRnsGaloisKey, PreparedHybridRnsGaloisKey, PreparedHybridRotationContext,
+    PreparedRnsGaloisKey, RnsCkksCiphertext, RnsCkksEvaluator,
 };
 use crate::matrix::RnsCkksCiphertextMatrix;
 use crate::ring::{ModulusChain, PreparedRnsNttPlan, RnsNttPlan};
@@ -3469,6 +3469,67 @@ pub fn execute_repeated_packed_fft2_dif_stage_cp_hybrid_prepared(
     evaluator.add(&partial, &right_term)
 }
 
+/// Executes a prepared encrypted FFT stage using level-aware hybrid keys.
+///
+/// The context supplies borrowed Gaussian-capable hybrid key material and
+/// its associated QP plans. No keys are generated during evaluation.
+///
+/// This adapter retains the existing prepared FFT arithmetic and does not
+/// permit fallback to conventional RNS rotation keys.
+pub fn execute_repeated_packed_fft2_dif_stage_cp_hybrid_context(
+    input: &RnsCkksCiphertext,
+    prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
+    evaluator: &RnsCkksEvaluator<'_>,
+    rotations: &PreparedHybridRotationContext<'_>,
+    chain: &ModulusChain,
+    prepared_plan: &PreparedRnsNttPlan,
+) -> RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    assert!(
+        std::ptr::eq(evaluator.chain(), chain),
+        "hybrid FFT evaluator and modulus chain mismatch"
+    );
+
+    assert_eq!(
+        prepared_fft_stage.level(),
+        input.level(),
+        "hybrid FFT stage level mismatch"
+    );
+
+    let degree = input.rlwe().degree();
+    let rotation = prepared_fft_stage.rotation();
+    let level = input.level();
+
+    let left_exponent = rotation_exponent_left(degree, rotation);
+    let right_exponent = rotation_exponent_right(degree, rotation);
+
+    let (left_key, left_plan) = rotations.key_for_level(level, left_exponent);
+    let (right_key, right_plan) = rotations.key_for_level(level, right_exponent);
+
+    assert_eq!(
+        left_plan.degree(),
+        right_plan.degree(),
+        "hybrid FFT QP plan degree mismatch"
+    );
+
+    assert_eq!(
+        left_plan.moduli(),
+        right_plan.moduli(),
+        "hybrid FFT left/right QP plans differ"
+    );
+
+    execute_repeated_packed_fft2_dif_stage_cp_hybrid_prepared(
+        input,
+        prepared_fft_stage,
+        evaluator,
+        (left_key, right_key),
+        chain,
+        left_plan,
+        prepared_plan,
+    )
+}
+
 pub fn execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared(
     input: &RnsCkksCiphertext,
     prepared_fft_stage: &PreparedRepeatedPackedFft2DifStage,
@@ -4893,6 +4954,195 @@ mod tests {
         }
 
         output
+    }
+
+    #[test]
+    fn gaussian_hybrid_context_fft_stage_matches_reference() {
+        use crate::application_support::ckks::encode_rns;
+        use crate::ckks::{CkksChainState, PreparedHybridRotationContext, RnsCkksEvaluationKeys};
+        use crate::grafting::{
+            decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng,
+            BoundedGadgetLayout,
+        };
+        use crate::ring::{
+            centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
+            Modulus, ModulusBasis,
+        };
+        use crate::rlwe::ErrorDistribution;
+        use num_traits::ToPrimitive;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        let profile = crate::ckks::research_profile_4096();
+        let degree = profile.degree();
+        let scale = profile.initial_scale();
+        let chain = profile.modulus_chain();
+        let q = chain.top().clone();
+
+        let embedding = CkksCanonicalEmbedding::new(degree);
+        let slots = embedding.slot_count();
+
+        let q_plan = RnsNttPlan::new(q.moduli().to_vec(), degree);
+        let prepared_q = PreparedRnsNttPlan::new(&q_plan);
+
+        let p = ModulusBasis::new(vec![Modulus::new(114_689), Modulus::new(786_433)]);
+
+        let mut qp_moduli = q.moduli().to_vec();
+        qp_moduli.extend_from_slice(p.moduli());
+        let qp_plan = RnsNttPlan::new(qp_moduli, degree);
+
+        let shape = Fft2Shape::new(2, 2);
+        let tile = [
+            Complex64::new(0.125, 0.0625),
+            Complex64::new(0.25, -0.125),
+            Complex64::new(0.375, 0.1875),
+            Complex64::new(0.5, -0.25),
+        ];
+
+        let input: Vec<Complex64> = (0..slots).map(|i| tile[i % 4]).collect();
+
+        let plaintext = encode_rns(&input, &embedding, &q, scale);
+
+        let secret: Vec<i8> = (0..degree)
+            .map(|i| match i % 4 {
+                0 => -1,
+                1 => 0,
+                2 => 1,
+                _ => 0,
+            })
+            .collect();
+
+        let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+        let mut encrypt_rng = ChaCha20Rng::seed_from_u64(0xA012_D001);
+
+        let encrypted = encrypt_rns_raw_with_distribution_ntt_rng(
+            &plaintext,
+            2,
+            distribution,
+            &secret,
+            &q_plan,
+            &mut encrypt_rng,
+        );
+
+        let ciphertext =
+            RnsCkksCiphertext::new(encrypted, CkksChainState::top(&chain, scale), &chain);
+
+        let evaluation_keys = RnsCkksEvaluationKeys::new();
+        let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
+
+        for axis in [PackedFft2Axis::Rows, PackedFft2Axis::Columns] {
+            let diagonals = PackedFft2DifStageDiagonals::new(shape, axis, 2, FftDirection::Forward);
+
+            let rotation = diagonals.rotation();
+            let left_exponent = rotation_exponent_left(degree, rotation);
+            let right_exponent = rotation_exponent_right(degree, rotation);
+
+            let make_key = |exponent: usize, seed: u64| {
+                let mut rng = ChaCha20Rng::seed_from_u64(seed);
+
+                PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    BoundedGadgetLayout::new(q.clone(), 8),
+                    p.clone(),
+                    &secret,
+                    exponent,
+                    distribution,
+                    2,
+                    &qp_plan,
+                    &mut rng,
+                )
+            };
+
+            let left_key = make_key(left_exponent, 0xA012_D002);
+            let right_key = make_key(right_exponent, 0xA012_D003);
+
+            let prepared_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &ciphertext,
+                &diagonals,
+                slots / shape.elements(),
+                &embedding,
+                &chain,
+                &q_plan,
+            );
+
+            let explicit = execute_repeated_packed_fft2_dif_stage_cp_hybrid_prepared(
+                &ciphertext,
+                &prepared_stage,
+                &evaluator,
+                (&left_key, &right_key),
+                &chain,
+                &qp_plan,
+                &prepared_q,
+            );
+
+            let mut context = PreparedHybridRotationContext::new(&chain);
+
+            context.insert(0, &left_key, &qp_plan);
+            if right_exponent != left_exponent {
+                context.insert(0, &right_key, &qp_plan);
+            }
+
+            let through_context = execute_repeated_packed_fft2_dif_stage_cp_hybrid_context(
+                &ciphertext,
+                &prepared_stage,
+                &evaluator,
+                &context,
+                &chain,
+                &prepared_q,
+            );
+
+            assert_eq!(explicit, through_context);
+            assert_eq!(through_context.level(), 1);
+
+            let result_plan = RnsNttPlan::new(through_context.basis().moduli().to_vec(), degree);
+
+            let decrypted = decrypt_rns_raw_with_ntt(through_context.rlwe(), &secret, &result_plan);
+
+            let modulus = composite_modulus_big(decrypted.basis());
+
+            let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+                .into_iter()
+                .map(|value| {
+                    centered_representative_big(&value, &modulus)
+                        .to_f64()
+                        .expect("CKKS coefficient fits f64")
+                        / through_context.scale()
+                })
+                .collect();
+
+            let actual = embedding.coefficients_to_slots(&coefficients);
+
+            let expected = execute_repeated_packed_fft2_dif_stage_pp(
+                &input,
+                &diagonals,
+                slots / shape.elements(),
+            );
+
+            let mut max_abs = 0.0_f64;
+            let mut error_squared = 0.0_f64;
+            let mut reference_squared = 0.0_f64;
+
+            for (observed, reference) in actual.iter().zip(expected.iter()) {
+                let error = (*observed - *reference).norm();
+                max_abs = max_abs.max(error);
+                error_squared += error * error;
+                reference_squared += reference.norm_sqr();
+            }
+
+            let rel_l2 = (error_squared / reference_squared).sqrt();
+
+            println!(
+                "M1_2E_HYBRID_FFT axis={axis:?} \
+                 max_abs={max_abs:.9e} rel_l2={rel_l2:.9e}"
+            );
+
+            assert!(
+                max_abs < 5.0e-3 && rel_l2 < 5.0e-3,
+                "hybrid FFT numerical tolerance exceeded"
+            );
+        }
+
+        println!("M1_2E_HYBRID_FFT_CONTEXT_STATUS=PASS");
     }
 
     #[test]
