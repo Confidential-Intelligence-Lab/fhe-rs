@@ -1665,7 +1665,17 @@ fn degree_65536_gaussian_hybrid_tile_block() {
     );
 
     const N: usize = 65_536;
-    const LEVEL: usize = 11;
+    let level: usize = std::env::var("FHE_M1_9_TILE_LEVEL")
+        .ok()
+        .map(|value| value.parse().expect("invalid tile level"))
+        .unwrap_or(11);
+
+    assert!(
+        (11..=13).contains(&level),
+        "tile level must be 11, 12, or 13"
+    );
+
+    let span_tiles = 8usize >> (level - 11);
     const BASE_LOG: u32 = 55;
 
     let profile = crate::ckks::research_profile_65536_for_levels(20, 2);
@@ -1674,9 +1684,10 @@ fn degree_65536_gaussian_hybrid_tile_block() {
     let embedding = CkksCanonicalEmbedding::new(N);
     let scale = profile.initial_scale();
 
-    let diagonals = PackedTileDifStageDiagonals::new_column(64, 64, 8, 8, FftDirection::Forward);
+    let diagonals =
+        PackedTileDifStageDiagonals::new_column(64, 64, 8, span_tiles, FftDirection::Forward);
 
-    assert_eq!(diagonals.rotation(), 16_384);
+    assert_eq!(diagonals.rotation(), 16_384usize >> (level - 11));
     assert_eq!(
         diagonals.packed_tiles() * diagonals.tile_elements(),
         embedding.slot_count()
@@ -1707,7 +1718,7 @@ fn degree_65536_gaussian_hybrid_tile_block() {
 
     let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
 
-    let q = chain.level(LEVEL).clone();
+    let q = chain.level(level).clone();
     let q_plan = RnsNttPlan::new(q.moduli().to_vec(), N);
 
     let plaintext = encode_rns(&input, &embedding, &q, scale);
@@ -1724,7 +1735,7 @@ fn degree_65536_gaussian_hybrid_tile_block() {
     );
 
     let ciphertext =
-        RnsCkksCiphertext::new(encrypted, CkksChainState::new(&chain, LEVEL, scale), &chain);
+        RnsCkksCiphertext::new(encrypted, CkksChainState::new(&chain, level, scale), &chain);
 
     let auxiliary = ModulusBasis::new(vec![
         Modulus::new(0x7ffffffbee0001),
@@ -1741,8 +1752,9 @@ fn degree_65536_gaussian_hybrid_tile_block() {
     let right_exponent = rotation_exponent_right(N, rotation);
 
     assert_eq!(
-        left_exponent, right_exponent,
-        "half-slot rotation must share one Galois exponent"
+        left_exponent == right_exponent,
+        span_tiles == 8,
+        "unexpected Galois exponent equivalence"
     );
 
     let layout = BoundedGadgetLayout::new(q, BASE_LOG);
@@ -1762,28 +1774,36 @@ fn degree_65536_gaussian_hybrid_tile_block() {
         &mut left_rng,
     );
 
-    let mut right_rng = ChaCha20Rng::seed_from_u64(0x519D_1001);
+    let right = if right_exponent != left_exponent {
+        let mut right_rng = ChaCha20Rng::seed_from_u64(0x519D_1001);
 
-    let right = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
-        layout,
-        auxiliary,
-        &secret,
-        right_exponent,
-        distribution,
-        2,
-        &qp_plan,
-        &mut right_rng,
-    );
+        let right_key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+            layout,
+            auxiliary,
+            &secret,
+            right_exponent,
+            distribution,
+            2,
+            &qp_plan,
+            &mut right_rng,
+        );
+
+        Some(right_key)
+    } else {
+        None
+    };
 
     let keygen_ms = keygen_start.elapsed().as_millis();
 
     let mut rotations = PreparedHybridRotationContext::new(&chain);
 
-    rotations.insert(LEVEL, &left, &qp_plan);
+    rotations.insert(level, &left, &qp_plan);
 
-    if right.exponent() != left.exponent() {
-        rotations.insert(LEVEL, &right, &qp_plan);
+    if let Some(right_key) = right.as_ref() {
+        rotations.insert(level, right_key, &qp_plan);
     }
+
+    assert_eq!(rotations.key_count(), if span_tiles == 8 { 1 } else { 2 });
 
     let evaluation_keys = RnsCkksEvaluationKeys::new();
     let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
@@ -1802,7 +1822,7 @@ fn degree_65536_gaussian_hybrid_tile_block() {
 
     let execution_ms = execute_start.elapsed().as_millis();
 
-    assert_eq!(output.level(), LEVEL + 1);
+    assert_eq!(output.level(), level + 1);
 
     let output_plan = RnsNttPlan::new(output.basis().moduli().to_vec(), N);
 
@@ -1846,7 +1866,7 @@ fn degree_65536_gaussian_hybrid_tile_block() {
          digits={} keygen_ms={} execution_ms={} \
          rel_l2={:.12e} max_abs={:.12e}",
         N,
-        LEVEL,
+        level,
         output.level(),
         rotation,
         left.digit_count(),
