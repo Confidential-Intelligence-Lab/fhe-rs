@@ -4,19 +4,15 @@ use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
     research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
     CkksCanonicalEmbedding, CkksChainState, PreparedRnsGaloisKey, RnsCkksCiphertext,
-    RnsCkksEvaluationKeys, RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
+    RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
 use ccmm_rs::eblas::fft::{
-    execute_packed_1k_fft_rows_cp, execute_packed_tile_dif_stage_cp_prepared,
-    execute_repeated_packed_fft2_dif_stage_cp_prepared, fft2_pp,
-    packed_fft_dif_butterfly_cp_prepared, Fft2Shape, FftDirection, PackedFft2Axis,
+    execute_packed_tile_dif_stage_cp_prepared, execute_repeated_packed_fft2_dif_stage_cp_prepared,
+    fft2_pp, packed_fft_dif_butterfly_cp_prepared, Fft2Shape, FftDirection, PackedFft2Axis,
     PackedFft2DifStageDiagonals, PackedTileDifStageDiagonals, PreparedRepeatedPackedFft2DifStage,
 };
 use ccmm_rs::eblas::PreparedComplexSlotsCp;
-use ccmm_rs::grafting::{
-    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout,
-    RnsKeygenConfig,
-};
+use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::ring::{
     centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
     PreparedRnsNttPlan, RnsNttPlan,
@@ -79,10 +75,6 @@ fn env_flag(name: &str) -> bool {
         Err(std::env::VarError::NotPresent) => false,
         Err(error) => panic!("failed to read {name}: {error}"),
     }
-}
-
-fn block_sizes(limb_count: usize) -> Vec<usize> {
-    vec![1; limb_count]
 }
 
 fn bit_reverse(index: usize, length: usize) -> usize {
@@ -409,6 +401,10 @@ fn main() {
 
     let hybrid_full_fft = env_flag("FHE_M1_9H_HYBRID_FFT2");
     let hybrid_row_only = env_flag("FHE_M1_8_HYBRID_ROW_ONLY") || hybrid_full_fft;
+    assert!(
+        hybrid_row_only,
+        "conventional 1K FFT execution has been retired; select Gaussian hybrid mode"
+    );
 
     if hybrid_full_fft {
         assert!(
@@ -601,166 +597,15 @@ fn main() {
      * ---------------------------------------------------------------
      */
     let schedule = key_schedule();
-
     println!("R17_1K_GALOIS_LEVEL_COUNT={}", schedule.len());
 
-    let keygen_start = Instant::now();
-
-    let mut evaluation_keys = RnsCkksEvaluationKeys::new();
-
-    let mut distinct_key_count = 0usize;
-
-    if !hybrid_row_only {
-        for &(level, rotation) in &schedule {
-            let level_basis = chain.level(level).clone();
-
-            let level_layout =
-                RnsGadgetLayout::new(level_basis.clone(), block_sizes(level_basis.len()));
-
-            let level_plan = RnsNttPlan::new(level_basis.moduli().to_vec(), degree);
-
-            let left_exponent = rotation_exponent_left(degree, rotation);
-
-            let right_exponent = rotation_exponent_right(degree, rotation);
-
-            let mut level_keys = RnsCkksLevelKeys::new(level, level_basis);
-
-            println!(
-            "R17_1K_KEYGEN_BEGIN level={} rotation={} limbs={} left_exponent={} right_exponent={}",
-            level,
-            rotation,
-            level_layout.full_basis().len(),
-            left_exponent,
-            right_exponent
-        );
-
-            io::stdout()
-                .flush()
-                .expect("R17 keygen progress must flush");
-
-            let level_start = Instant::now();
-
-            if left_exponent == right_exponent {
-                let mut rng =
-                    ChaCha20Rng::seed_from_u64(0x5231_374b_4559_0000 ^ ((level as u64) << 8));
-
-                let key = RnsGaloisKey::generate_with_ntt_rng(
-                    RnsKeygenConfig {
-                        degree,
-                        plaintext_modulus: 2,
-                        noise_bound: 0,
-                        layout: level_layout.clone(),
-                        plan: &level_plan,
-                    },
-                    &secret,
-                    left_exponent,
-                    &mut rng,
-                );
-
-                level_keys.insert_galois_key(key);
-                distinct_key_count += 1;
-
-                println!(
-                    "R17_1K_KEYGEN_KEY level={} direction=shared exponent={}",
-                    level, left_exponent
-                );
-            } else {
-                let ((left_key, left_ms), (right_key, right_ms)) = std::thread::scope(|scope| {
-                    let left_worker = scope.spawn(|| {
-                        let start = Instant::now();
-
-                        let mut rng = ChaCha20Rng::seed_from_u64(
-                            0x5231_374b_4559_0000 ^ ((level as u64) << 8),
-                        );
-
-                        let key = RnsGaloisKey::generate_with_ntt_rng(
-                            RnsKeygenConfig {
-                                degree,
-                                plaintext_modulus: 2,
-                                noise_bound: 0,
-                                layout: level_layout.clone(),
-                                plan: &level_plan,
-                            },
-                            &secret,
-                            left_exponent,
-                            &mut rng,
-                        );
-
-                        (key, start.elapsed().as_millis())
-                    });
-
-                    let right_worker = scope.spawn(|| {
-                        let start = Instant::now();
-
-                        let mut rng = ChaCha20Rng::seed_from_u64(
-                            0x5231_374b_4559_0001 ^ ((level as u64) << 8),
-                        );
-
-                        let key = RnsGaloisKey::generate_with_ntt_rng(
-                            RnsKeygenConfig {
-                                degree,
-                                plaintext_modulus: 2,
-                                noise_bound: 0,
-                                layout: level_layout.clone(),
-                                plan: &level_plan,
-                            },
-                            &secret,
-                            right_exponent,
-                            &mut rng,
-                        );
-
-                        (key, start.elapsed().as_millis())
-                    });
-
-                    (
-                        left_worker.join().expect("R17 left keygen worker panicked"),
-                        right_worker
-                            .join()
-                            .expect("R17 right keygen worker panicked"),
-                    )
-                });
-
-                println!(
-                    "R17_1K_KEYGEN_KEY level={} direction=left exponent={} elapsed_ms={}",
-                    level, left_exponent, left_ms
-                );
-
-                println!(
-                    "R17_1K_KEYGEN_KEY level={} direction=right exponent={} elapsed_ms={}",
-                    level, right_exponent, right_ms
-                );
-
-                level_keys.insert_galois_key(left_key);
-                level_keys.insert_galois_key(right_key);
-
-                distinct_key_count += 2;
-            }
-
-            evaluation_keys.insert_level(level_keys);
-
-            println!(
-                "R17_1K_KEYGEN_END level={} elapsed_ms={}",
-                level,
-                level_start.elapsed().as_millis()
-            );
-        }
-    }
-
-    let keygen_ms = keygen_start.elapsed().as_millis();
-
-    println!("R17_1K_GALOIS_DISTINCT_KEY_COUNT={distinct_key_count}");
-    println!("R17_1K_KEYGEN_TOTAL_MS={keygen_ms}");
-
-    if !hybrid_row_only {
-        assert_eq!(distinct_key_count, 29);
-    } else {
-        assert_eq!(distinct_key_count, 0);
-    }
-
+    // All FFT rotations use Gaussian hybrid evaluation keys.
+    let evaluation_keys = RnsCkksEvaluationKeys::new();
     let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
 
-    let mut reported_key_count = distinct_key_count;
-    let mut reported_keygen_ms = keygen_ms;
+    let mut reported_key_count = 0usize;
+    let mut reported_keygen_ms = 0u128;
+
     let mut hybrid_key_material = Vec::new();
 
     if hybrid_row_only {
@@ -835,7 +680,7 @@ fn main() {
      */
     let row_phase_start = Instant::now();
 
-    values = if hybrid_row_only {
+    values = {
         let mut rotations = PreparedHybridRotationContext::new(&chain);
 
         for (level, left, right, plan) in &hybrid_key_material {
@@ -861,15 +706,6 @@ fn main() {
         );
 
         output
-    } else {
-        execute_packed_1k_fft_rows_cp(
-            values,
-            &evaluator,
-            &embedding,
-            &chain,
-            inter_ct_parallelism,
-            local_outer_parallelism,
-        )
     };
 
     /*
