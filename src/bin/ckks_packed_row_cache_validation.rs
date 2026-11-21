@@ -1,16 +1,10 @@
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
-    research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
-    CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext, RnsCkksEvaluationKeys,
-    RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
+    research_profile_65536_for_levels, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
+    RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
-use ccmm_rs::eblas::fft::{
-    execute_packed_1k_fft_rows_cp, execute_packed_1k_fft_rows_cp_cached,
-    PackedRowPreparationContext,
-};
-use ccmm_rs::grafting::{
-    encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout, RnsKeygenConfig,
-};
+use ccmm_rs::eblas::fft::PackedRowPreparationContext;
+use ccmm_rs::grafting::encrypt_rns_raw_with_distribution_ntt_rng;
 use ccmm_rs::ring::RnsNttPlan;
 use ccmm_rs::rlwe::ErrorDistribution;
 use num_complex::Complex64;
@@ -51,51 +45,59 @@ fn main() {
     }
 
     let keygen_start = Instant::now();
-    let mut evaluation_keys = RnsCkksEvaluationKeys::new();
-    let mut key_count = 0usize;
+    // Generate Gaussian hybrid rotation keys once for both cache runs.
+    // Deterministic seeds are validation fixtures only.
+    let auxiliary = ccmm_rs::ring::ModulusBasis::new(vec![
+        ccmm_rs::ring::Modulus::new(0x7ffffffbee0001),
+        ccmm_rs::ring::Modulus::new(0x7ffffffbe40001),
+    ]);
 
-    for (level, rotation) in (6usize..12).zip([32usize, 16, 8, 4, 2, 1]) {
-        let level_basis = chain.level(level).clone();
-        let layout = RnsGadgetLayout::new(level_basis.clone(), vec![1; level_basis.len()]);
-        let level_plan = RnsNttPlan::new(level_basis.moduli().to_vec(), degree);
+    let schedule = ccmm_rs::eblas::fft::packed_1k_hybrid_rotation_schedule(
+        START_LEVEL,
+        ccmm_rs::eblas::fft::PackedFft2Axis::Rows,
+    );
 
-        let left = rotation_exponent_left(degree, rotation);
-        let right = rotation_exponent_right(degree, rotation);
-        let mut level_keys = RnsCkksLevelKeys::new(level, level_basis);
+    assert_eq!(schedule.len(), 6);
 
-        for (index, exponent) in [left, right].into_iter().enumerate() {
-            if index == 1 && left == right {
-                continue;
-            }
+    let mut key_material = Vec::new();
 
-            let mut rng = ChaCha20Rng::seed_from_u64(
-                0x524f_574b_4559_0000 ^ ((level as u64) << 8) ^ (index as u64),
-            );
+    for (level, rotation) in schedule {
+        let mut left_rng = ChaCha20Rng::seed_from_u64(0x518B_1000 + level as u64 * 2);
+        let mut right_rng = ChaCha20Rng::seed_from_u64(0x518B_1001 + level as u64 * 2);
 
-            let key = RnsGaloisKey::generate_with_ntt_rng(
-                RnsKeygenConfig {
-                    degree,
-                    plaintext_modulus: 2,
-                    noise_bound: 0,
-                    layout: layout.clone(),
-                    plan: &level_plan,
-                },
-                &secret,
-                exponent,
-                &mut rng,
-            );
+        let (left, right, plan) = ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
+            &chain,
+            degree,
+            level,
+            rotation,
+            &secret,
+            &auxiliary,
+            55,
+            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+            2,
+            &mut left_rng,
+            &mut right_rng,
+        );
 
-            level_keys.insert_galois_key(key);
-            key_count += 1;
-        }
-
-        evaluation_keys.insert_level(level_keys);
+        let right = right.expect("row rotation requires two keys");
+        key_material.push((level, left, right, plan));
         println!("ROW_CACHE_KEYGEN_LEVEL={level} rotation={rotation}");
     }
+
+    let mut rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &key_material {
+        rotations.insert(*level, left, plan);
+        rotations.insert(*level, right, plan);
+    }
+
+    let key_count = rotations.key_count();
+    assert_eq!(key_count, 12);
 
     println!("ROW_CACHE_KEY_COUNT={key_count}");
     println!("ROW_CACHE_KEYGEN_MS={}", keygen_start.elapsed().as_millis());
 
+    let evaluation_keys = RnsCkksEvaluationKeys::new();
     let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
 
     let make_macrotile = |macro_index: usize| -> Vec<RnsCkksCiphertext> {
@@ -136,13 +138,13 @@ fn main() {
 
     let first_input = make_macrotile(0);
     let first_start = Instant::now();
-    let first_output = execute_packed_1k_fft_rows_cp_cached(
+    let first_output = ccmm_rs::eblas::fft::execute_packed_1k_fft_rows_cp_hybrid_cached(
         first_input,
         &evaluator,
+        &rotations,
         &embedding,
         &chain,
-        2,
-        4,
+        (2, 4),
         &mut cache,
     );
 
@@ -162,20 +164,28 @@ fn main() {
     let reference_input = second_input.clone();
 
     let cached_start = Instant::now();
-    let cached = execute_packed_1k_fft_rows_cp_cached(
+    let cached = ccmm_rs::eblas::fft::execute_packed_1k_fft_rows_cp_hybrid_cached(
         second_input,
         &evaluator,
+        &rotations,
         &embedding,
         &chain,
-        2,
-        4,
+        (2, 4),
         &mut cache,
     );
     let cached_ms = cached_start.elapsed().as_millis();
 
+    let mut fresh_cache = PackedRowPreparationContext::new();
     let uncached_start = Instant::now();
-    let uncached =
-        execute_packed_1k_fft_rows_cp(reference_input, &evaluator, &embedding, &chain, 2, 4);
+    let uncached = ccmm_rs::eblas::fft::execute_packed_1k_fft_rows_cp_hybrid_cached(
+        reference_input,
+        &evaluator,
+        &rotations,
+        &embedding,
+        &chain,
+        (2, 4),
+        &mut fresh_cache,
+    );
     let uncached_ms = uncached_start.elapsed().as_millis();
 
     assert_eq!(cached.len(), CT_PER_MACRO);
