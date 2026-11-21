@@ -1336,3 +1336,262 @@ fn degree_65536_single_hybrid_key_smoke() {
         elapsed_ms,
     );
 }
+
+#[test]
+#[ignore = "large degree-65536 six-stage Gaussian hybrid integration"]
+fn degree_65536_six_stage_hybrid_row_fft() {
+    use crate::application_support::ckks::encode_rns;
+    use crate::ckks::{
+        CkksChainState, PreparedHybridRnsGaloisKey, PreparedHybridRotationContext,
+        RnsCkksEvaluationKeys,
+    };
+    use crate::grafting::{
+        decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
+    };
+    use crate::ring::{
+        centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, Modulus,
+        ModulusBasis, RnsNttPlan,
+    };
+    use crate::rlwe::ErrorDistribution;
+    use num_traits::ToPrimitive;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    assert_eq!(
+        std::env::var("FHE_M1_6_ALLOW_FULL_KEYS").as_deref(),
+        Ok("1"),
+        "explicit full-key experiment opt-in required"
+    );
+
+    const N: usize = 65_536;
+    const START_LEVEL: usize = 4;
+    const BASE_LOG: u32 = 55;
+    const SPANS: [usize; 6] = [64, 32, 16, 8, 4, 2];
+
+    let profile = crate::ckks::research_profile_65536_for_levels(20, 2);
+    let chain = profile.modulus_chain();
+    let embedding = CkksCanonicalEmbedding::new(N);
+    let scale = profile.initial_scale();
+
+    let shape = Fft2Shape::new(2, 64);
+    let tiles_per_ciphertext = embedding.slot_count() / shape.elements();
+
+    assert_eq!(tiles_per_ciphertext, 256);
+
+    let auxiliary = ModulusBasis::new(vec![
+        Modulus::new(0x7ffffffbee0001),
+        Modulus::new(0x7ffffffbe40001),
+    ]);
+
+    let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+    let secret: Vec<i8> = (0..N)
+        .map(|index| match index % 4 {
+            0 => -1,
+            1 => 0,
+            2 => 1,
+            _ => 0,
+        })
+        .collect();
+
+    let input: Vec<Complex64> = (0..embedding.slot_count())
+        .map(|index| {
+            let i = index % shape.elements();
+            Complex64::new((i + 1) as f64 / 256.0, (i % 7) as f64 / 512.0)
+        })
+        .collect();
+
+    let initial_basis = chain.level(START_LEVEL);
+    let initial_plan = RnsNttPlan::new(initial_basis.moduli().to_vec(), N);
+
+    let plaintext = encode_rns(&input, &embedding, initial_basis, scale);
+
+    let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x5160_0000);
+
+    let encrypted = encrypt_rns_raw_with_distribution_ntt_rng(
+        &plaintext,
+        2,
+        distribution,
+        &secret,
+        &initial_plan,
+        &mut encryption_rng,
+    );
+
+    let ciphertext = RnsCkksCiphertext::new(
+        encrypted,
+        CkksChainState::new(&chain, START_LEVEL, scale),
+        &chain,
+    );
+
+    // Generate one left/right key pair per CKKS level.
+    // All key material remains externally owned.
+    let mut key_material = Vec::with_capacity(SPANS.len());
+
+    let keygen_start = std::time::Instant::now();
+
+    for (stage, span) in SPANS.into_iter().enumerate() {
+        let level = START_LEVEL + stage;
+        let q = chain.level(level).clone();
+
+        let mut qp_moduli = q.moduli().to_vec();
+        qp_moduli.extend_from_slice(auxiliary.moduli());
+
+        let qp_plan = RnsNttPlan::new(qp_moduli, N);
+        let layout = BoundedGadgetLayout::new(q, BASE_LOG);
+
+        let rotation = span / 2;
+        let left_exponent = rotation_exponent_left(N, rotation);
+        let right_exponent = rotation_exponent_right(N, rotation);
+
+        let mut left_rng = ChaCha20Rng::seed_from_u64(0x5160_1000 + (stage as u64) * 2);
+
+        let left = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+            layout.clone(),
+            auxiliary.clone(),
+            &secret,
+            left_exponent,
+            distribution,
+            2,
+            &qp_plan,
+            &mut left_rng,
+        );
+
+        let mut right_rng = ChaCha20Rng::seed_from_u64(0x5160_1001 + (stage as u64) * 2);
+
+        let right = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+            layout,
+            auxiliary.clone(),
+            &secret,
+            right_exponent,
+            distribution,
+            2,
+            &qp_plan,
+            &mut right_rng,
+        );
+
+        println!(
+            "M1_6_KEY_STAGE=PASS stage={} level={} \
+             span={} rotation={} digits={}",
+            stage + 1,
+            level,
+            span,
+            rotation,
+            left.digit_count(),
+        );
+
+        key_material.push((left, right, qp_plan));
+    }
+
+    let keygen_ms = keygen_start.elapsed().as_millis();
+
+    let mut rotations = PreparedHybridRotationContext::new(&chain);
+
+    for (stage, (left, right, plan)) in key_material.iter().enumerate() {
+        let level = START_LEVEL + stage;
+        rotations.insert(level, left, plan);
+        rotations.insert(level, right, plan);
+    }
+
+    let evaluation_keys = RnsCkksEvaluationKeys::new();
+    let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
+
+    let mut cache = PackedRowPreparationContext::new();
+
+    let execute_start = std::time::Instant::now();
+
+    let result = execute_packed_local_rows_cp_hybrid_staged_cached(
+        vec![ciphertext],
+        (shape, tiles_per_ciphertext),
+        &evaluator,
+        &rotations,
+        &embedding,
+        &chain,
+        (1, &mut cache),
+    );
+
+    let execute_ms = execute_start.elapsed().as_millis();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].level(), START_LEVEL + 6);
+    assert_eq!(cache.hybrid_preparations, 6);
+    assert_eq!(cache.hybrid_hits, 0);
+
+    let mut expected = input;
+
+    for span in SPANS {
+        let diagonals = PackedFft2DifStageDiagonals::new(
+            shape,
+            PackedFft2Axis::Rows,
+            span,
+            FftDirection::Forward,
+        );
+
+        expected =
+            execute_repeated_packed_fft2_dif_stage_pp(&expected, &diagonals, tiles_per_ciphertext);
+    }
+
+    let output = &result[0];
+
+    let output_plan = RnsNttPlan::new(output.basis().moduli().to_vec(), N);
+
+    let decrypted = decrypt_rns_raw_with_ntt(output.rlwe(), &secret, &output_plan);
+
+    let modulus = composite_modulus_big(decrypted.basis());
+
+    let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+        .iter()
+        .map(|residue| {
+            centered_representative_big(residue, &modulus)
+                .to_f64()
+                .expect("CKKS coefficient conversion failed")
+                / output.scale()
+        })
+        .collect();
+
+    let decoded = embedding.coefficients_to_slots(&coefficients);
+
+    assert_eq!(decoded.len(), expected.len());
+
+    let mut squared_error = 0.0_f64;
+    let mut squared_reference = 0.0_f64;
+    let mut max_abs_error = 0.0_f64;
+
+    for (actual, reference) in decoded.iter().zip(expected.iter()) {
+        let error = (*actual - *reference).norm();
+
+        squared_error += error * error;
+        squared_reference += reference.norm_sqr();
+        max_abs_error = max_abs_error.max(error);
+    }
+
+    let relative_l2 = (squared_error / squared_reference).sqrt();
+
+    println!(
+        "M1_6_SIX_STAGE_METRICS degree={} \
+         level_in={} level_out={} \
+         ciphertexts={} keys={} \
+         keygen_ms={} execution_ms={} \
+         rel_l2={:.12e} max_abs={:.12e} \
+         cache_preparations={} cache_hits={}",
+        N,
+        START_LEVEL,
+        output.level(),
+        result.len(),
+        key_material.len() * 2,
+        keygen_ms,
+        execute_ms,
+        relative_l2,
+        max_abs_error,
+        cache.hybrid_preparations,
+        cache.hybrid_hits,
+    );
+
+    assert!(relative_l2.is_finite());
+    assert!(max_abs_error.is_finite());
+    assert!(
+        relative_l2 <= 5e-3,
+        "full-degree six-stage hybrid FFT accuracy failed"
+    );
+
+    println!("M1_6_SIX_STAGE_STATUS=PASS");
+}
