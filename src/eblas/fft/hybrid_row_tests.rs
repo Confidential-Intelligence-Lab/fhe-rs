@@ -1363,6 +1363,26 @@ fn degree_65536_six_stage_hybrid_row_fft() {
         "explicit full-key experiment opt-in required"
     );
 
+    let ciphertext_count: usize = std::env::var("FHE_M1_7_CIPHERTEXTS")
+        .ok()
+        .map(|value| value.parse().expect("invalid ciphertext count"))
+        .unwrap_or(1);
+
+    assert!(
+        [1, 2, 4, 8].contains(&ciphertext_count),
+        "unsupported bounded ciphertext count"
+    );
+
+    let parallelism: usize = std::env::var("FHE_M1_7_PARALLELISM")
+        .ok()
+        .map(|value| value.parse().expect("invalid parallelism"))
+        .unwrap_or(1);
+
+    assert!(
+        (1..=4).contains(&parallelism),
+        "parallelism must be between 1 and 4"
+    );
+
     const N: usize = 65_536;
     const START_LEVEL: usize = 4;
     const BASE_LOG: u32 = 55;
@@ -1406,22 +1426,28 @@ fn degree_65536_six_stage_hybrid_row_fft() {
 
     let plaintext = encode_rns(&input, &embedding, initial_basis, scale);
 
-    let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x5160_0000);
+    let ciphertexts: Vec<RnsCkksCiphertext> = (0..ciphertext_count)
+        .map(|index| {
+            let mut rng = ChaCha20Rng::seed_from_u64(0x5160_0000 + index as u64);
 
-    let encrypted = encrypt_rns_raw_with_distribution_ntt_rng(
-        &plaintext,
-        2,
-        distribution,
-        &secret,
-        &initial_plan,
-        &mut encryption_rng,
-    );
+            let encrypted = encrypt_rns_raw_with_distribution_ntt_rng(
+                &plaintext,
+                2,
+                distribution,
+                &secret,
+                &initial_plan,
+                &mut rng,
+            );
 
-    let ciphertext = RnsCkksCiphertext::new(
-        encrypted,
-        CkksChainState::new(&chain, START_LEVEL, scale),
-        &chain,
-    );
+            RnsCkksCiphertext::new(
+                encrypted,
+                CkksChainState::new(&chain, START_LEVEL, scale),
+                &chain,
+            )
+        })
+        .collect();
+
+    assert_eq!(ciphertexts.len(), ciphertext_count);
 
     // Generate one left/right key pair per CKKS level.
     // All key material remains externally owned.
@@ -1500,18 +1526,18 @@ fn degree_65536_six_stage_hybrid_row_fft() {
     let execute_start = std::time::Instant::now();
 
     let result = execute_packed_local_rows_cp_hybrid_staged_cached(
-        vec![ciphertext],
+        ciphertexts,
         (shape, tiles_per_ciphertext),
         &evaluator,
         &rotations,
         &embedding,
         &chain,
-        (1, &mut cache),
+        (parallelism, &mut cache),
     );
 
     let execute_ms = execute_start.elapsed().as_millis();
 
-    assert_eq!(result.len(), 1);
+    assert_eq!(result.len(), ciphertext_count);
     assert_eq!(result[0].level(), START_LEVEL + 6);
     assert_eq!(cache.hybrid_preparations, 6);
     assert_eq!(cache.hybrid_hits, 0);
@@ -1530,68 +1556,84 @@ fn degree_65536_six_stage_hybrid_row_fft() {
             execute_repeated_packed_fft2_dif_stage_pp(&expected, &diagonals, tiles_per_ciphertext);
     }
 
-    let output = &result[0];
+    let mut worst_relative_l2 = 0.0_f64;
+    let mut worst_max_abs = 0.0_f64;
 
-    let output_plan = RnsNttPlan::new(output.basis().moduli().to_vec(), N);
+    for (index, output) in result.iter().enumerate() {
+        assert_eq!(output.level(), START_LEVEL + 6);
 
-    let decrypted = decrypt_rns_raw_with_ntt(output.rlwe(), &secret, &output_plan);
+        let output_plan = RnsNttPlan::new(output.basis().moduli().to_vec(), N);
 
-    let modulus = composite_modulus_big(decrypted.basis());
+        let decrypted = decrypt_rns_raw_with_ntt(output.rlwe(), &secret, &output_plan);
 
-    let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
-        .iter()
-        .map(|residue| {
-            centered_representative_big(residue, &modulus)
-                .to_f64()
-                .expect("CKKS coefficient conversion failed")
-                / output.scale()
-        })
-        .collect();
+        let modulus = composite_modulus_big(decrypted.basis());
 
-    let decoded = embedding.coefficients_to_slots(&coefficients);
+        let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+            .iter()
+            .map(|residue| {
+                centered_representative_big(residue, &modulus)
+                    .to_f64()
+                    .expect("CKKS coefficient conversion failed")
+                    / output.scale()
+            })
+            .collect();
 
-    assert_eq!(decoded.len(), expected.len());
+        let decoded = embedding.coefficients_to_slots(&coefficients);
 
-    let mut squared_error = 0.0_f64;
-    let mut squared_reference = 0.0_f64;
-    let mut max_abs_error = 0.0_f64;
+        assert_eq!(decoded.len(), expected.len());
 
-    for (actual, reference) in decoded.iter().zip(expected.iter()) {
-        let error = (*actual - *reference).norm();
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        let mut max_abs_error = 0.0_f64;
 
-        squared_error += error * error;
-        squared_reference += reference.norm_sqr();
-        max_abs_error = max_abs_error.max(error);
+        for (actual, reference) in decoded.iter().zip(expected.iter()) {
+            let error = (*actual - *reference).norm();
+
+            squared_error += error * error;
+            squared_reference += reference.norm_sqr();
+            max_abs_error = max_abs_error.max(error);
+        }
+
+        assert!(squared_reference > 0.0);
+
+        let relative_l2 = (squared_error / squared_reference).sqrt();
+
+        println!(
+            "M1_7_CIPHERTEXT_METRICS index={}              rel_l2={:.12e} max_abs={:.12e}",
+            index, relative_l2, max_abs_error,
+        );
+
+        assert!(relative_l2.is_finite());
+        assert!(max_abs_error.is_finite());
+
+        assert!(
+            relative_l2 <= 5e-3,
+            "six-stage hybrid FFT ciphertext accuracy failed"
+        );
+
+        worst_relative_l2 = worst_relative_l2.max(relative_l2);
+
+        worst_max_abs = worst_max_abs.max(max_abs_error);
     }
 
-    let relative_l2 = (squared_error / squared_reference).sqrt();
-
     println!(
-        "M1_6_SIX_STAGE_METRICS degree={} \
-         level_in={} level_out={} \
-         ciphertexts={} keys={} \
-         keygen_ms={} execution_ms={} \
-         rel_l2={:.12e} max_abs={:.12e} \
-         cache_preparations={} cache_hits={}",
+        "M1_7_MULTICT_METRICS degree={}          ciphertexts={} parallelism={} keys={}          keygen_ms={} execution_ms={}          worst_rel_l2={:.12e} worst_max_abs={:.12e}          cache_preparations={} cache_hits={}",
         N,
-        START_LEVEL,
-        output.level(),
-        result.len(),
+        ciphertext_count,
+        parallelism,
         key_material.len() * 2,
         keygen_ms,
         execute_ms,
-        relative_l2,
-        max_abs_error,
+        worst_relative_l2,
+        worst_max_abs,
         cache.hybrid_preparations,
         cache.hybrid_hits,
     );
 
-    assert!(relative_l2.is_finite());
-    assert!(max_abs_error.is_finite());
-    assert!(
-        relative_l2 <= 5e-3,
-        "full-degree six-stage hybrid FFT accuracy failed"
-    );
+    assert_eq!(cache.hybrid_preparations, 6);
+    assert_eq!(cache.hybrid_hits, 0);
+
+    println!("M1_7_MULTICT_STATUS=PASS");
 
     println!("M1_6_SIX_STAGE_STATUS=PASS");
 }
