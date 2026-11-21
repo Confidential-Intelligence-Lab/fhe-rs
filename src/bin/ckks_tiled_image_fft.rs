@@ -136,6 +136,92 @@ fn fft_local_tile_workers() -> usize {
 const FFT_GLOBAL_PAIR_PARALLELISM: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
+fn execute_gaussian_hybrid_local_stage(
+    randomness_mode: FftRandomnessMode,
+    values: &[RnsCkksCiphertext],
+    diagonals: &PackedFft2DifStageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    secret: &[i8],
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    stage_plan: &RnsNttPlan,
+) -> Vec<RnsCkksCiphertext> {
+    use ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_cp_hybrid_prepared;
+    use ccmm_rs::ring::{Modulus, ModulusBasis};
+
+    const BASE_LOG: u32 = 55;
+
+    assert!(!values.is_empty(), "hybrid stage requires ciphertexts");
+
+    let level = values[0].level();
+    assert!(values.iter().all(|v| v.level() == level));
+
+    let degree = embedding.degree();
+    assert_eq!(stage_plan.degree(), degree);
+
+    let rotation = diagonals.rotation();
+    let auxiliary = ModulusBasis::new(vec![
+        Modulus::new(0x7ffffffbee0001),
+        Modulus::new(0x7ffffffbe40001),
+    ]);
+
+    let seed = ((level as u64) << 32) ^ rotation as u64;
+    let mut left_rng = randomness_mode.rng(0x4859_4252_4944_0000 ^ seed);
+    let mut right_rng = randomness_mode.rng(0x4859_4252_4944_0001 ^ seed);
+
+    let (left, right, qp_plan) = ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
+        chain,
+        degree,
+        level,
+        rotation,
+        secret,
+        &auxiliary,
+        BASE_LOG,
+        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+        2,
+        &mut left_rng,
+        &mut right_rng,
+    );
+
+    let right = right.expect("hybrid local FFT requires distinct rotation keys");
+
+    let prepared_plan = PreparedRnsNttPlan::new(stage_plan);
+
+    let outputs: Vec<RnsCkksCiphertext> = values
+        .iter()
+        .map(|input| {
+            let prepared = PreparedRepeatedPackedFft2DifStage::new(
+                input, diagonals, 1, embedding, chain, stage_plan,
+            );
+
+            execute_repeated_packed_fft2_dif_stage_cp_hybrid_prepared(
+                input,
+                &prepared,
+                evaluator,
+                (&left, &right),
+                chain,
+                &qp_plan,
+                &prepared_plan,
+            )
+        })
+        .collect();
+
+    assert!(
+        outputs.iter().all(|v| v.level() == level + 1),
+        "hybrid local FFT must consume exactly one CKKS level"
+    );
+
+    println!(
+        "TILED_FFT_HYBRID_STAGE_STATUS=PASS level={} rotation={} ciphertexts={}",
+        level,
+        rotation,
+        outputs.len()
+    );
+
+    outputs
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_bounded_gaussian_local_stage(
     randomness_mode: FftRandomnessMode,
     direct_prepared: bool,
@@ -2294,17 +2380,30 @@ fn main() {
             galois_key_mode,
             FftGaloisKeyMode::BoundedGaussian | FftGaloisKeyMode::BoundedGaussianDirect
         ) {
-            values = execute_bounded_gaussian_local_stage(
-                randomness_mode,
-                galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect,
-                &values,
-                &diagonals,
-                &evaluator,
-                &secret,
-                &embedding,
-                &chain,
-                &stage_plan,
-            );
+            values = if galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect {
+                execute_gaussian_hybrid_local_stage(
+                    randomness_mode,
+                    &values,
+                    &diagonals,
+                    &evaluator,
+                    &secret,
+                    &embedding,
+                    &chain,
+                    &stage_plan,
+                )
+            } else {
+                execute_bounded_gaussian_local_stage(
+                    randomness_mode,
+                    false,
+                    &values,
+                    &diagonals,
+                    &evaluator,
+                    &secret,
+                    &embedding,
+                    &chain,
+                    &stage_plan,
+                )
+            };
         } else {
             let stage_state = values
                 .first()
@@ -2559,17 +2658,30 @@ fn main() {
             galois_key_mode,
             FftGaloisKeyMode::BoundedGaussian | FftGaloisKeyMode::BoundedGaussianDirect
         ) {
-            values = execute_bounded_gaussian_local_stage(
-                randomness_mode,
-                galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect,
-                &values,
-                &diagonals,
-                &evaluator,
-                &secret,
-                &embedding,
-                &chain,
-                &stage_plan,
-            );
+            values = if galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect {
+                execute_gaussian_hybrid_local_stage(
+                    randomness_mode,
+                    &values,
+                    &diagonals,
+                    &evaluator,
+                    &secret,
+                    &embedding,
+                    &chain,
+                    &stage_plan,
+                )
+            } else {
+                execute_bounded_gaussian_local_stage(
+                    randomness_mode,
+                    false,
+                    &values,
+                    &diagonals,
+                    &evaluator,
+                    &secret,
+                    &embedding,
+                    &chain,
+                    &stage_plan,
+                )
+            };
         } else {
             let stage_state = values
                 .first()
