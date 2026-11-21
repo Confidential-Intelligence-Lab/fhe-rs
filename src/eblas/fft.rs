@@ -1327,7 +1327,6 @@ pub fn packed_fft_dif_butterfly_cp_prepared(
 /// Construct a new context when changing the evaluator, embedding, or modulus chain.
 #[derive(Default)]
 pub struct PackedRowPreparationContext<'a> {
-    local_stages: Vec<Option<PreparedLocalRowStage>>,
     hybrid_stages: Vec<Option<HybridPreparedLocalRowStage>>,
     hybrid_preparations: usize,
     hybrid_hits: usize,
@@ -1336,16 +1335,6 @@ pub struct PackedRowPreparationContext<'a> {
         &'a ModulusChain,
         &'a CkksCanonicalEmbedding,
     )>,
-}
-
-struct PreparedLocalRowStage {
-    state: crate::ckks::CkksChainState,
-    span: usize,
-    stage_plan: RnsNttPlan,
-    prepared_plan: PreparedRnsNttPlan,
-    prepared_left: PreparedRnsGaloisKey,
-    prepared_right: PreparedRnsGaloisKey,
-    prepared_fft_stage: PreparedRepeatedPackedFft2DifStage,
 }
 
 struct HybridPreparedLocalRowStage {
@@ -1361,7 +1350,6 @@ struct HybridPreparedLocalRowStage {
 impl<'a> PackedRowPreparationContext<'a> {
     pub fn new() -> Self {
         Self {
-            local_stages: (0..6).map(|_| None).collect(),
             hybrid_stages: (0..6).map(|_| None).collect(),
             hybrid_preparations: 0,
             hybrid_hits: 0,
@@ -1391,8 +1379,7 @@ impl<'a> PackedRowPreparationContext<'a> {
             }
             None => {
                 assert!(
-                    self.local_stages.iter().all(Option::is_none)
-                        && self.hybrid_stages.iter().all(Option::is_none),
+                    self.hybrid_stages.iter().all(Option::is_none),
                     "unbound row cache contains prepared stages"
                 );
                 self.binding = Some((evaluator.keys(), chain, embedding));
@@ -1425,25 +1412,6 @@ mod row_cache_binding_tests {
     }
 }
 
-pub fn execute_packed_1k_fft_rows_cp(
-    values: Vec<RnsCkksCiphertext>,
-    evaluator: &RnsCkksEvaluator<'_>,
-    embedding: &CkksCanonicalEmbedding,
-    chain: &ModulusChain,
-    inter_ct_parallelism: usize,
-    local_outer_parallelism: usize,
-) -> Vec<RnsCkksCiphertext> {
-    execute_packed_1k_fft_rows_cp_inner(
-        values,
-        evaluator,
-        embedding,
-        chain,
-        inter_ct_parallelism,
-        local_outer_parallelism,
-        (None, None),
-    )
-}
-
 fn prepare_row_stage_diagonals(tile_shape: Fft2Shape, span: usize) -> PackedFft2DifStageDiagonals {
     PackedFft2DifStageDiagonals::new(
         tile_shape,
@@ -1461,72 +1429,6 @@ fn prepare_row_stage_ntt(
     let plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
     let prepared = PreparedRnsNttPlan::new(&plan);
     (plan, prepared)
-}
-
-fn prepare_local_row_stage(
-    input: &RnsCkksCiphertext,
-    span: usize,
-    tile_shape: Fft2Shape,
-    tiles_per_ciphertext: usize,
-    evaluator: &RnsCkksEvaluator<'_>,
-    embedding: &CkksCanonicalEmbedding,
-    chain: &ModulusChain,
-) -> PreparedLocalRowStage {
-    let diagonals = prepare_row_stage_diagonals(tile_shape, span);
-    let rotation = diagonals.rotation();
-    let degree = embedding.degree();
-    let left_exponent = rotation_exponent_left(degree, rotation);
-    let right_exponent = rotation_exponent_right(degree, rotation);
-    let (stage_plan, prepared_plan) = prepare_row_stage_ntt(input.level(), degree, chain);
-    let state = input.state().clone();
-    let prepared_left = PreparedRnsGaloisKey::new(
-        evaluator.keys().galois_for(&state, left_exponent),
-        &stage_plan,
-    );
-    let prepared_right = PreparedRnsGaloisKey::new(
-        evaluator.keys().galois_for(&state, right_exponent),
-        &stage_plan,
-    );
-    let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
-        input,
-        &diagonals,
-        tiles_per_ciphertext,
-        embedding,
-        chain,
-        &stage_plan,
-    );
-    PreparedLocalRowStage {
-        state,
-        span,
-        stage_plan,
-        prepared_plan,
-        prepared_left,
-        prepared_right,
-        prepared_fft_stage,
-    }
-}
-
-/// Reuses local-stage preparation across compatible macrotiles in one row phase.
-pub fn execute_packed_1k_fft_rows_cp_cached<'a>(
-    values: Vec<RnsCkksCiphertext>,
-    evaluator: &RnsCkksEvaluator<'a>,
-    embedding: &'a CkksCanonicalEmbedding,
-    chain: &'a ModulusChain,
-    inter_ct_parallelism: usize,
-    local_outer_parallelism: usize,
-    context: &mut PackedRowPreparationContext<'a>,
-) -> Vec<RnsCkksCiphertext> {
-    context.bind(evaluator, embedding, chain);
-
-    execute_packed_1k_fft_rows_cp_inner(
-        values,
-        evaluator,
-        embedding,
-        chain,
-        inter_ct_parallelism,
-        local_outer_parallelism,
-        (Some(context), None),
-    )
 }
 
 /// Executes the complete 1K row FFT using Gaussian hybrid
@@ -1557,7 +1459,7 @@ pub fn execute_packed_1k_fft_rows_cp_hybrid_cached<'a>(
         chain,
         inter_ct_parallelism,
         local_outer_parallelism,
-        (Some(context), Some(rotations)),
+        (context, rotations),
     )
 }
 
@@ -1568,9 +1470,9 @@ fn execute_packed_1k_fft_rows_cp_inner<'a>(
     chain: &'a ModulusChain,
     inter_ct_parallelism: usize,
     local_outer_parallelism: usize,
-    (mut context, rotations): (
-        Option<&mut PackedRowPreparationContext<'a>>,
-        Option<&PreparedHybridRotationContext<'_>>,
+    (context, rotations): (
+        &mut PackedRowPreparationContext<'a>,
+        &PreparedHybridRotationContext<'_>,
     ),
 ) -> Vec<RnsCkksCiphertext> {
     const TILE_DIM: usize = 64;
@@ -1589,11 +1491,6 @@ fn execute_packed_1k_fft_rows_cp_inner<'a>(
     assert!(local_outer_parallelism > 0);
 
     let profile_rows = std::env::var("FHE_R23_PROFILE_ROWS").ok().as_deref() == Some("1");
-    let mut total_prepare_ms = 0.0_f64;
-    let mut total_execute_ms = 0.0_f64;
-
-    let use_ntt_resident =
-        std::env::var("FHE_PACKED_1K_NTT_RESIDENT").is_ok_and(|value| value == "1");
 
     let degree = embedding.degree();
     let slot_count = embedding.slot_count();
@@ -1740,8 +1637,6 @@ fn execute_packed_1k_fft_rows_cp_inner<'a>(
 
         let execute_ms = execution_start.elapsed().as_secs_f64() * 1000.0;
         if profile_rows {
-            total_prepare_ms += prepare_ms;
-            total_execute_ms += execute_ms;
             println!(
                 "R23_ROW_STAGE kind=global level={} span={} prepare_ms={:.3} execute_ms={:.3}",
                 level, stage_span, prepare_ms, execute_ms
@@ -1760,153 +1655,28 @@ fn execute_packed_1k_fft_rows_cp_inner<'a>(
     /*
      * Six repeated packed local-row stages.
      */
-    if let Some(rotations) = rotations {
-        let shared = context
-            .as_deref_mut()
-            .expect("hybrid 1K row execution requires a preparation context");
+    // Six Gaussian hybrid local-row stages.
+    values = execute_packed_local_rows_cp_hybrid_staged_cached(
+        values,
+        (tile_shape, TILES_PER_CIPHERTEXT),
+        evaluator,
+        rotations,
+        embedding,
+        chain,
+        (local_outer_parallelism, context),
+    );
 
-        values = execute_packed_local_rows_cp_hybrid_staged_cached(
-            values,
-            (tile_shape, TILES_PER_CIPHERTEXT),
-            evaluator,
-            rotations,
-            embedding,
-            chain,
-            (local_outer_parallelism, shared),
-        );
-
-        assert_eq!(
-            values.len(),
-            CIPHERTEXT_COUNT,
-            "hybrid 1K row output count mismatch"
-        );
-
-        assert_eq!(
-            values[0].level(),
-            start_level + 10,
-            "hybrid 1K row must consume exactly ten CKKS levels"
-        );
-
-        return values;
-    }
-
-    let mut span = TILE_DIM;
-
-    while span >= 2 {
-        let stage_start = std::time::Instant::now();
-        let stage_span = span;
-        let level = values[0].level();
-
-        let slot = (TILE_DIM / span).trailing_zeros() as usize;
-        let owned_stage;
-        let stage: &PreparedLocalRowStage = if let Some(shared) = context.as_deref_mut() {
-            if shared.local_stages.is_empty() {
-                shared.local_stages = (0..6).map(|_| None).collect();
-            }
-            let entry = &mut shared.local_stages[slot];
-            if entry.is_none() {
-                *entry = Some(prepare_local_row_stage(
-                    &values[0],
-                    span,
-                    tile_shape,
-                    TILES_PER_CIPHERTEXT,
-                    evaluator,
-                    embedding,
-                    chain,
-                ));
-                if profile_rows {
-                    println!("R23_CACHE kind=local span={} status=MISS", span);
-                }
-            } else if profile_rows {
-                println!("R23_CACHE kind=local span={} status=HIT", span);
-            }
-            let prepared = entry.as_ref().expect("local stage preparation missing");
-            assert_eq!(prepared.span, span, "cached local stage span mismatch");
-            assert_eq!(
-                &prepared.state,
-                values[0].state(),
-                "cached CKKS state mismatch"
-            );
-            prepared
-        } else {
-            owned_stage = prepare_local_row_stage(
-                &values[0],
-                span,
-                tile_shape,
-                TILES_PER_CIPHERTEXT,
-                evaluator,
-                embedding,
-                chain,
-            );
-            &owned_stage
-        };
-
-        let stage_input = values;
-        let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
-
-        let prepare_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
-        let execution_start = std::time::Instant::now();
-
-        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
-            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
-
-            let batch = std::thread::scope(|scope| {
-                let mut workers = Vec::new();
-
-                for input in stage_input.iter().take(batch_end).skip(batch_start) {
-                    workers.push(scope.spawn(|| {
-                        let execute_stage = if use_ntt_resident {
-                            execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident
-                        } else {
-                            execute_repeated_packed_fft2_dif_stage_cp_prepared
-                        };
-                        execute_stage(
-                            input,
-                            &stage.prepared_fft_stage,
-                            evaluator,
-                            (&stage.prepared_left, &stage.prepared_right),
-                            chain,
-                            &stage.stage_plan,
-                            &stage.prepared_plan,
-                        )
-                    }));
-                }
-
-                workers
-                    .into_iter()
-                    .map(|worker| worker.join().expect("packed 1K local-row worker panicked"))
-                    .collect::<Vec<_>>()
-            });
-
-            stage_output.extend(batch);
-        }
-
-        values = stage_output;
-        let execute_ms = execution_start.elapsed().as_secs_f64() * 1000.0;
-        if profile_rows {
-            total_prepare_ms += prepare_ms;
-            total_execute_ms += execute_ms;
-            println!(
-                "R23_ROW_STAGE kind=local level={} span={} prepare_ms={:.3} execute_ms={:.3}",
-                level, stage_span, prepare_ms, execute_ms
-            );
-        }
-
-        span /= 2;
-    }
+    assert_eq!(
+        values.len(),
+        CIPHERTEXT_COUNT,
+        "hybrid 1K row output count mismatch"
+    );
 
     assert_eq!(
         values[0].level(),
         start_level + 10,
-        "packed 1K row phase must consume exactly ten CKKS levels"
+        "hybrid 1K row must consume exactly ten CKKS levels"
     );
-
-    if profile_rows {
-        println!(
-            "R23_ROW_TOTAL prepare_ms={:.3} execute_ms={:.3}",
-            total_prepare_ms, total_execute_ms
-        );
-    }
 
     values
 }
