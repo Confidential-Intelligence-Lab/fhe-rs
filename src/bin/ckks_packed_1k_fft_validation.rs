@@ -31,11 +31,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use ccmm_rs::ckks::{PreparedHybridRnsGaloisKey, PreparedHybridRotationContext};
+use ccmm_rs::ckks::PreparedHybridRotationContext;
 use ccmm_rs::eblas::fft::{
     execute_packed_1k_fft_rows_cp_hybrid_cached, PackedRowPreparationContext,
 };
-use ccmm_rs::grafting::BoundedGadgetLayout;
 use ccmm_rs::ring::{Modulus, ModulusBasis};
 
 const SIGMA: f64 = 3.19;
@@ -387,49 +386,16 @@ fn clear_global_column_inter_stage(values: Vec<Vec<Complex64>>) -> Vec<Vec<Compl
 }
 
 fn key_schedule() -> Vec<(usize, usize)> {
-    let mut schedule = Vec::new();
+    use ccmm_rs::eblas::fft::packed_1k_hybrid_rotation_schedule;
 
-    /*
-     * Local row stages, levels 4..9.
-     */
-    let mut level = 4usize;
-    let mut rotation = TILE_DIM / 2;
+    let mut schedule = packed_1k_hybrid_rotation_schedule(0, PackedFft2Axis::Rows);
 
-    while rotation > 0 {
-        schedule.push((level, rotation));
-        level += 1;
-        rotation /= 2;
-    }
+    schedule.extend(packed_1k_hybrid_rotation_schedule(
+        10,
+        PackedFft2Axis::Columns,
+    ));
 
-    assert_eq!(level, 10);
-
-    /*
-     * Level 10 is the inter-CT global-column span-16 stage.
-     *
-     * Levels 11..13 are the new tile-block stages.
-     */
-    schedule.push((11, 16_384));
-    schedule.push((12, 8_192));
-    schedule.push((13, 4_096));
-
-    /*
-     * Local column stages, levels 14..19.
-     *
-     * For a 64x64 tile the six column-stage rotations are:
-     * 2048, 1024, 512, 256, 128, 64.
-     */
-    level = 14;
-    rotation = (TILE_DIM / 2) * TILE_DIM;
-
-    while rotation >= TILE_DIM {
-        schedule.push((level, rotation));
-        level += 1;
-        rotation /= 2;
-    }
-
-    assert_eq!(level, 20);
     assert_eq!(schedule.len(), 15);
-
     schedule
 }
 
@@ -810,42 +776,25 @@ fn main() {
         for &(level, rotation) in schedule.iter().take(6) {
             assert!((4..=9).contains(&level));
 
-            let q = chain.level(level).clone();
-
-            let mut qp_moduli = q.moduli().to_vec();
-            qp_moduli.extend_from_slice(auxiliary.moduli());
-
-            let qp_plan = RnsNttPlan::new(qp_moduli, degree);
-            let layout = BoundedGadgetLayout::new(q, BASE_LOG);
-
-            let left_exponent = rotation_exponent_left(degree, rotation);
-            let right_exponent = rotation_exponent_right(degree, rotation);
-
             let mut left_rng = ChaCha20Rng::seed_from_u64(0x518B_1000 + level as u64 * 2);
-
-            let left = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
-                layout.clone(),
-                auxiliary.clone(),
-                &secret,
-                left_exponent,
-                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                2,
-                &qp_plan,
-                &mut left_rng,
-            );
-
             let mut right_rng = ChaCha20Rng::seed_from_u64(0x518B_1001 + level as u64 * 2);
 
-            let right = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
-                layout,
-                auxiliary.clone(),
-                &secret,
-                right_exponent,
-                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                2,
-                &qp_plan,
-                &mut right_rng,
-            );
+            let (left, right, qp_plan) =
+                ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
+                    &chain,
+                    degree,
+                    level,
+                    rotation,
+                    &secret,
+                    &auxiliary,
+                    BASE_LOG,
+                    ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                    2,
+                    &mut left_rng,
+                    &mut right_rng,
+                );
+
+            let right = right.expect("local-row stage requires distinct keys");
 
             println!(
                 "M1_8B_KEY_STAGE=PASS level={} rotation={} digits={}",
@@ -1058,49 +1007,23 @@ fn main() {
             assert_eq!(rotation, expected_rotation);
 
             let stage_start = Instant::now();
-            let q = chain.level(stage_level).clone();
-
-            let mut qp_moduli = q.moduli().to_vec();
-            qp_moduli.extend_from_slice(auxiliary.moduli());
-
-            let qp_plan = RnsNttPlan::new(qp_moduli, degree);
-            let layout = BoundedGadgetLayout::new(q, 55);
-
-            let left_exponent = rotation_exponent_left(degree, rotation);
-            let right_exponent = rotation_exponent_right(degree, rotation);
-
             let mut left_rng = ChaCha20Rng::seed_from_u64(0x519D_1000 + stage_level as u64 * 2);
+            let mut right_rng = ChaCha20Rng::seed_from_u64(0x519D_1001 + stage_level as u64 * 2);
 
-            let left = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
-                layout.clone(),
-                auxiliary.clone(),
-                &secret,
-                left_exponent,
-                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                2,
-                &qp_plan,
-                &mut left_rng,
-            );
-
-            let right = if right_exponent != left_exponent {
-                let mut right_rng =
-                    ChaCha20Rng::seed_from_u64(0x519D_1001 + stage_level as u64 * 2);
-
-                Some(
-                    PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
-                        layout,
-                        auxiliary.clone(),
-                        &secret,
-                        right_exponent,
-                        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                        2,
-                        &qp_plan,
-                        &mut right_rng,
-                    ),
-                )
-            } else {
-                None
-            };
+            let (left, right, qp_plan) =
+                ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
+                    &chain,
+                    degree,
+                    stage_level,
+                    rotation,
+                    &secret,
+                    &auxiliary,
+                    55,
+                    ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                    2,
+                    &mut left_rng,
+                    &mut right_rng,
+                );
 
             let keys = 1 + usize::from(right.is_some());
             column_key_count += keys;

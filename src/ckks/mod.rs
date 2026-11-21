@@ -664,3 +664,5 @@ pub use bounded_rns_galois_key::{
 };
 
 pub use rns_galois_key::apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident_shared_b;
+
+pub use hybrid_rns_galois_key::generate_hybrid_rotation_stage_keys_with_rng;

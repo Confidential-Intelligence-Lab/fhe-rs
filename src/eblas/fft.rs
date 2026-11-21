@@ -1911,6 +1911,100 @@ fn execute_packed_1k_fft_rows_cp_inner<'a>(
     values
 }
 
+/// Returns the level-relative Gaussian hybrid rotation schedule for
+/// a packed 1024-point row or column FFT.
+///
+/// Inter-ciphertext butterfly stages do not require rotation keys.
+/// The caller must provide a modulus chain containing every level.
+pub fn packed_1k_hybrid_rotation_schedule(
+    start_level: usize,
+    axis: PackedFft2Axis,
+) -> Vec<(usize, usize)> {
+    let mut schedule = Vec::new();
+
+    match axis {
+        PackedFft2Axis::Rows => {
+            for (index, rotation) in [32, 16, 8, 4, 2, 1].into_iter().enumerate() {
+                schedule.push((
+                    start_level
+                        .checked_add(4 + index)
+                        .expect("row FFT level overflow"),
+                    rotation,
+                ));
+            }
+        }
+        PackedFft2Axis::Columns => {
+            for (index, rotation) in [16_384, 8_192, 4_096, 2_048, 1_024, 512, 256, 128, 64]
+                .into_iter()
+                .enumerate()
+            {
+                schedule.push((
+                    start_level
+                        .checked_add(1 + index)
+                        .expect("column FFT level overflow"),
+                    rotation,
+                ));
+            }
+        }
+    }
+
+    schedule
+}
+
+#[cfg(test)]
+mod packed_1k_hybrid_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn schedule_matches_1k_layout() {
+        let rows = packed_1k_hybrid_rotation_schedule(0, PackedFft2Axis::Rows);
+        let columns = packed_1k_hybrid_rotation_schedule(10, PackedFft2Axis::Columns);
+
+        assert_eq!(
+            rows,
+            vec![(4, 32), (5, 16), (6, 8), (7, 4), (8, 2), (9, 1),]
+        );
+
+        assert_eq!(
+            columns,
+            vec![
+                (11, 16_384),
+                (12, 8_192),
+                (13, 4_096),
+                (14, 2_048),
+                (15, 1_024),
+                (16, 512),
+                (17, 256),
+                (18, 128),
+                (19, 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn schedule_matches_shifted_4k_layout() {
+        let rows = packed_1k_hybrid_rotation_schedule(2, PackedFft2Axis::Rows);
+        let columns = packed_1k_hybrid_rotation_schedule(14, PackedFft2Axis::Columns);
+
+        assert_eq!(rows.len(), 6);
+        assert_eq!(columns.len(), 9);
+
+        assert_eq!(rows.first(), Some(&(6, 32)));
+        assert_eq!(rows.last(), Some(&(11, 1)));
+        assert_eq!(columns.first(), Some(&(15, 16_384)));
+        assert_eq!(columns.last(), Some(&(23, 64)));
+    }
+
+    #[test]
+    fn schedule_matches_shifted_sar_columns() {
+        let columns = packed_1k_hybrid_rotation_schedule(16, PackedFft2Axis::Columns);
+
+        assert_eq!(columns.len(), 9);
+        assert_eq!(columns.first(), Some(&(17, 16_384)));
+        assert_eq!(columns.last(), Some(&(25, 64)));
+    }
+}
+
 /// Executes work with stage-local Gaussian hybrid rotation keys.
 ///
 /// The provider owns key generation and returns prepared evaluation keys

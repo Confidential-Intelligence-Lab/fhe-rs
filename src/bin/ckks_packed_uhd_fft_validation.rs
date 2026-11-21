@@ -274,37 +274,16 @@ fn error_metrics_physical_vs_oracle(physical: &[Complex64], oracle: &[Complex64]
 }
 
 fn key_schedule_4k() -> Vec<(usize, usize)> {
-    let mut schedule = Vec::new();
+    use ccmm_rs::eblas::fft::{packed_1k_hybrid_rotation_schedule, PackedFft2Axis};
 
-    // 1K row engine starts at level 2.
-    let mut level = 6usize;
-    let mut rotation = TILE_DIM / 2;
+    let mut schedule = packed_1k_hybrid_rotation_schedule(2, PackedFft2Axis::Rows);
 
-    while rotation > 0 {
-        schedule.push((level, rotation));
-        level += 1;
-        rotation /= 2;
-    }
+    schedule.extend(packed_1k_hybrid_rotation_schedule(
+        14,
+        PackedFft2Axis::Columns,
+    ));
 
-    assert_eq!(level, 12);
-
-    // 1K column engine starts at level 14.
-    schedule.push((15, 16_384));
-    schedule.push((16, 8_192));
-    schedule.push((17, 4_096));
-
-    level = 18;
-    rotation = (TILE_DIM / 2) * TILE_DIM;
-
-    while rotation >= TILE_DIM {
-        schedule.push((level, rotation));
-        level += 1;
-        rotation /= 2;
-    }
-
-    assert_eq!(level, 24);
     assert_eq!(schedule.len(), 15);
-
     schedule
 }
 
