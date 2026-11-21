@@ -46,7 +46,7 @@ enum FftGaloisKeyMode {
 impl FftGaloisKeyMode {
     fn from_environment() -> Self {
         match std::env::var("FFT_GALOIS_KEY_MODE")
-            .unwrap_or_else(|_| "baseline".to_string())
+            .unwrap_or_else(|_| "bounded_gaussian_direct".to_string())
             .as_str()
         {
             "baseline" => Self::Baseline,
@@ -78,7 +78,7 @@ enum FftRandomnessMode {
 impl FftRandomnessMode {
     fn from_environment() -> Self {
         match std::env::var("FFT_RANDOMNESS_MODE")
-            .unwrap_or_else(|_| "deterministic".to_string())
+            .unwrap_or_else(|_| "secure".to_string())
             .as_str()
         {
             "deterministic" => Self::Deterministic,
@@ -1441,6 +1441,11 @@ fn main() {
     let galois_key_mode = FftGaloisKeyMode::from_environment();
     let randomness_mode = FftRandomnessMode::from_environment();
 
+    assert!(
+        galois_key_mode != FftGaloisKeyMode::Baseline,
+        "zero-noise FFT Galois keys are unsupported; use Gaussian hybrid execution"
+    );
+
     if randomness_mode == FftRandomnessMode::Secure {
         assert!(
             galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect,
@@ -1483,7 +1488,7 @@ fn main() {
     println!("FFT_TOTAL_MODULUS_BITS={}", profile.total_modulus_bits());
     println!("FFT_INITIAL_SCALE={scale:.12e}");
     println!("FFT_ENCRYPTION_SIGMA={SIGMA:.6}");
-    println!("FFT_GALOIS_KEY_NOISE_BOUND=0");
+
     println!("FFT_GALOIS_KEY_MODE={}", galois_key_mode.label());
     println!(
         "FFT_GALOIS_KEY_ERROR_DISTRIBUTION={}",
