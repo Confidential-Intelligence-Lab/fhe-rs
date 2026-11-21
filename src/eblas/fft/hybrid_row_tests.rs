@@ -798,3 +798,541 @@ fn gaussian_hybrid_six_stage_row_fft() {
 
     println!("M1_3H_SIX_STAGE_HYBRID_ROW_STATUS=PASS");
 }
+
+#[test]
+fn degree_65536_hybrid_qp_preflight() {
+    use crate::grafting::BoundedGadgetLayout;
+    use crate::ring::{Modulus, ModulusBasis, RnsNttPlan};
+
+    const DEGREE: usize = 65_536;
+    const P0: u64 = 0x7ffffffbee0001;
+    const P1: u64 = 0x7ffffffbe40001;
+
+    let auxiliary = ModulusBasis::new(vec![Modulus::new(P0), Modulus::new(P1)]);
+
+    let p_plan = RnsNttPlan::new(auxiliary.moduli().to_vec(), DEGREE);
+
+    assert_eq!(p_plan.degree(), DEGREE);
+    assert_eq!(p_plan.moduli(), auxiliary.moduli());
+
+    let configurations = [("1K", 20, 2, 4), ("UHD", 24, 2, 6), ("8K", 26, 2, 7)];
+
+    for (name, depth, guard, first_level) in configurations {
+        let profile = crate::ckks::research_profile_65536_for_levels(depth, guard);
+        let chain = profile.modulus_chain();
+
+        for level in [first_level, first_level + 5] {
+            let q = chain.level(level).clone();
+
+            for modulus in q.moduli() {
+                assert_ne!(modulus.value(), P0);
+                assert_ne!(modulus.value(), P1);
+            }
+
+            let mut qp_moduli = q.moduli().to_vec();
+            qp_moduli.extend_from_slice(auxiliary.moduli());
+
+            let qp_plan = RnsNttPlan::new(qp_moduli, DEGREE);
+
+            assert_eq!(qp_plan.degree(), DEGREE);
+            assert_eq!(qp_plan.moduli().len(), q.len() + auxiliary.len(),);
+
+            for base_log in [32, 40, 55] {
+                let layout = BoundedGadgetLayout::new(q.clone(), base_log);
+
+                let digits = layout.digit_count();
+
+                let key_bytes =
+                    2_u128 * DEGREE as u128 * qp_plan.moduli().len() as u128 * digits as u128 * 8;
+
+                println!(
+                    "M1_5C_QP_CASE=PASS workload={} level={} base={}                      q_limbs={} p_limbs={} digits={}                      estimated_key_mib={:.2}",
+                    name,
+                    level,
+                    base_log,
+                    q.len(),
+                    auxiliary.len(),
+                    digits,
+                    key_bytes as f64 / 1_048_576.0,
+                );
+            }
+        }
+    }
+
+    println!("M1_5C_DEGREE_65536_QP_STATUS=PASS");
+}
+
+#[test]
+#[ignore = "allocates a production-sized Gaussian hybrid key"]
+fn degree_65536_single_hybrid_key_smoke() {
+    use crate::ckks::{rotation_exponent_left, PreparedHybridRnsGaloisKey};
+    use crate::grafting::BoundedGadgetLayout;
+    use crate::ring::{Modulus, ModulusBasis, RnsNttPlan};
+    use crate::rlwe::ErrorDistribution;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    const N: usize = 65_536;
+    let level: usize = std::env::var("FHE_HYBRID_TEST_LEVEL")
+        .ok()
+        .map(|value| value.parse().expect("invalid test level"))
+        .unwrap_or(9);
+
+    assert!([4, 9].contains(&level));
+    let base_log: u32 = std::env::var("FHE_HYBRID_TEST_BASE_LOG")
+        .ok()
+        .map(|value| value.parse().expect("invalid gadget base"))
+        .unwrap_or(32);
+
+    assert!(
+        [32, 40, 55].contains(&base_log),
+        "unsupported experimental gadget base"
+    );
+
+    let profile = crate::ckks::research_profile_65536_for_levels(20, 2);
+    let chain = profile.modulus_chain();
+
+    let q = chain.level(level).clone();
+
+    let p = ModulusBasis::new(vec![
+        Modulus::new(0x7ffffffbee0001),
+        Modulus::new(0x7ffffffbe40001),
+    ]);
+
+    let mut qp_moduli = q.moduli().to_vec();
+    qp_moduli.extend_from_slice(p.moduli());
+
+    let qp_plan = RnsNttPlan::new(qp_moduli, N);
+    let layout = BoundedGadgetLayout::new(q, base_log);
+    let expected_digits = layout.digit_count();
+
+    assert_eq!(
+        expected_digits,
+        match (level, base_log) {
+            (4, 32) => 31,
+            (4, 40) => 25,
+            (4, 55) => 19,
+            (9, 32) => 23,
+            (9, 40) => 18,
+            (9, 55) => 14,
+            _ => unreachable!(),
+        },
+    );
+
+    let secret: Vec<i8> = (0..N)
+        .map(|index| match index % 3 {
+            0 => -1,
+            1 => 0,
+            _ => 1,
+        })
+        .collect();
+
+    let stage_span = match level {
+        4 => 64_usize,
+        9 => 2_usize,
+        _ => unreachable!(),
+    };
+    let rotation_steps = stage_span / 2;
+
+    let exponent = rotation_exponent_left(N, rotation_steps);
+
+    // Deterministic research fixture only.
+    // Production key generation must use fresh OS entropy.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x5150_3635_3533_3609);
+
+    let started = std::time::Instant::now();
+
+    let key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+        layout,
+        p.clone(),
+        &secret,
+        exponent,
+        ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+        2,
+        &qp_plan,
+        &mut rng,
+    );
+
+    let elapsed_ms = started.elapsed().as_millis();
+
+    assert_eq!(key.degree(), N);
+    assert_eq!(key.exponent(), exponent);
+    assert_eq!(key.digit_count(), expected_digits);
+    assert_eq!(key.auxiliary_basis(), &p);
+
+    // Independent sparse-polynomial automorphism oracle.
+    // The expected result is computed from X^N = -1 and
+    // X^i -> X^(i * exponent), without calling the rotation code.
+    use crate::ckks::{CkksChainState, PreparedHybridRotationContext};
+    use crate::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
+    use crate::ring::{
+        centered_representative_big, composite_modulus_big, reconstruct_coefficients_big,
+        Polynomial, RnsPolynomial,
+    };
+    use num_bigint::BigInt;
+    use num_traits::{Signed, ToPrimitive};
+
+    let sparse = [
+        (0_usize, 1_i64 << 32),
+        (1, 2_i64 << 32),
+        (17, 3_i64 << 32),
+        (N / 2 + 7, 4_i64 << 32),
+        (N - 1, 5_i64 << 32),
+    ];
+
+    let mut message = vec![0_i64; N];
+
+    for (index, coefficient) in sparse {
+        message[index] = coefficient;
+    }
+
+    let plaintext = RnsPolynomial::from_residues(
+        chain
+            .level(level)
+            .moduli()
+            .iter()
+            .copied()
+            .map(|modulus| {
+                Polynomial::new(
+                    modulus,
+                    message
+                        .iter()
+                        .map(|&value| value.rem_euclid(modulus.value() as i64) as u64)
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
+
+    let q_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), N);
+
+    let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x5150_3635_3533_3610);
+
+    let encrypted = encrypt_rns_raw_with_distribution_ntt_rng(
+        &plaintext,
+        2,
+        ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+        &secret,
+        &q_plan,
+        &mut encryption_rng,
+    );
+
+    let ciphertext = RnsCkksCiphertext::new(
+        encrypted,
+        CkksChainState::new(&chain, level, profile.initial_scale()),
+        &chain,
+    );
+
+    let right_exponent = crate::ckks::rotation_exponent_right(N, rotation_steps);
+
+    assert_ne!(exponent, right_exponent);
+
+    let mut right_rng = ChaCha20Rng::seed_from_u64(0x5150_3635_3533_3611);
+
+    let right_started = std::time::Instant::now();
+
+    let right_key = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+        BoundedGadgetLayout::new(chain.level(level).clone(), base_log),
+        p.clone(),
+        &secret,
+        right_exponent,
+        ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+        2,
+        &qp_plan,
+        &mut right_rng,
+    );
+
+    let right_keygen_ms = right_started.elapsed().as_millis();
+    assert_eq!(right_key.degree(), N);
+    assert_eq!(right_key.digit_count(), expected_digits);
+
+    let mut rotation_context = PreparedHybridRotationContext::new(&chain);
+
+    rotation_context.insert(level, &key, &qp_plan);
+    rotation_context.insert(level, &right_key, &qp_plan);
+
+    let rotation_start = std::time::Instant::now();
+    let rotated = rotation_context.rotate_left(&ciphertext, rotation_steps);
+    let rotation_ms = rotation_start.elapsed().as_millis();
+
+    assert_eq!(rotated.level(), level);
+    assert_eq!(rotated.state(), ciphertext.state());
+
+    let decrypted = decrypt_rns_raw_with_ntt(rotated.rlwe(), &secret, &q_plan);
+
+    let modulus = composite_modulus_big(decrypted.basis());
+    let reconstructed = reconstruct_coefficients_big(&decrypted);
+
+    assert_eq!(reconstructed.len(), N);
+
+    // Compute the expected negacyclic automorphism independently.
+    let mut expected = vec![0_i64; N];
+
+    for (index, coefficient) in sparse {
+        let mapped = (index * exponent) % (2 * N);
+
+        if mapped < N {
+            expected[mapped] += coefficient;
+        } else {
+            expected[mapped - N] -= coefficient;
+        }
+    }
+
+    let mut max_abs_error = BigInt::from(0);
+    let mut error_count = 0usize;
+
+    for (index, residue) in reconstructed.iter().enumerate() {
+        let actual = centered_representative_big(residue, &modulus);
+
+        let error = (actual - BigInt::from(expected[index])).abs();
+
+        if error > BigInt::from(0) {
+            error_count += 1;
+        }
+
+        if error > max_abs_error {
+            max_abs_error = error;
+        }
+    }
+
+    // Exploratory coefficient-domain tolerance.
+    // Must be reviewed against actual noise and CKKS precision.
+    let tolerance = BigInt::from(1_i64 << 20);
+
+    println!(
+        "M1_5D_ROTATION_METRICS degree={} level={}          base={} p_limbs={} keygen_ms={} rotation_ms={}          max_abs_coeff_error={} nonzero_error_coeffs={}          tolerance={}",
+        N,
+        level,
+        base_log,
+        p.len(),
+        elapsed_ms,
+        rotation_ms,
+        max_abs_error,
+        error_count,
+        tolerance,
+    );
+
+    assert!(
+        max_abs_error <= tolerance,
+        "degree-65536 hybrid rotation exceeded coefficient tolerance"
+    );
+
+    println!("M1_5D_ROTATION_ORACLE_STATUS=PASS");
+
+    let right_started = std::time::Instant::now();
+    let right_rotated = rotation_context.rotate_right(&ciphertext, rotation_steps);
+    let right_rotation_ms = right_started.elapsed().as_millis();
+
+    assert_eq!(right_rotated.level(), level);
+    assert_eq!(right_rotated.state(), ciphertext.state());
+
+    let right_decrypted = decrypt_rns_raw_with_ntt(right_rotated.rlwe(), &secret, &q_plan);
+
+    let right_modulus = composite_modulus_big(right_decrypted.basis());
+    let right_coefficients = reconstruct_coefficients_big(&right_decrypted);
+
+    let mut right_expected = vec![0_i64; N];
+
+    for (index, coefficient) in sparse {
+        let mapped = (index * right_exponent) % (2 * N);
+
+        if mapped < N {
+            right_expected[mapped] += coefficient;
+        } else {
+            right_expected[mapped - N] -= coefficient;
+        }
+    }
+
+    let mut right_max_error = BigInt::from(0);
+    let mut right_nonzero_errors = 0usize;
+
+    for (index, residue) in right_coefficients.iter().enumerate() {
+        let actual = centered_representative_big(residue, &right_modulus);
+
+        let error = (actual - BigInt::from(right_expected[index])).abs();
+
+        if error > BigInt::from(0) {
+            right_nonzero_errors += 1;
+        }
+
+        if error > right_max_error {
+            right_max_error = error;
+        }
+    }
+
+    println!(
+        "M1_5G_RIGHT_ROTATION_METRICS level={} base={}          keygen_ms={} rotation_ms={} max_abs_coeff_error={}          nonzero_error_coeffs={}",
+        level,
+        base_log,
+        right_keygen_ms,
+        right_rotation_ms,
+        right_max_error,
+        right_nonzero_errors,
+    );
+
+    assert!(
+        right_max_error <= tolerance,
+        "right rotation exceeded coefficient tolerance"
+    );
+
+    println!("M1_5G_BIDIRECTIONAL_ROTATION_STATUS=PASS");
+
+    // Complete packed CKKS butterfly at the active modulus-chain level.
+    // Reuses the two Gaussian hybrid keys already generated above.
+    {
+        use crate::application_support::ckks::encode_rns;
+        use crate::ckks::{RnsCkksEvaluationKeys, RnsCkksEvaluator};
+
+        let embedding = CkksCanonicalEmbedding::new(N);
+        let shape = Fft2Shape::new(2, 64);
+        let tile_size = shape.elements();
+        let tiles_per_ciphertext = embedding.slot_count() / tile_size;
+
+        let input_slots: Vec<Complex64> = (0..embedding.slot_count())
+            .map(|index| {
+                let i = index % tile_size;
+                Complex64::new((i + 1) as f64 / 256.0, (i % 7) as f64 / 512.0)
+            })
+            .collect();
+
+        let plaintext = encode_rns(
+            &input_slots,
+            &embedding,
+            chain.level(level),
+            profile.initial_scale(),
+        );
+
+        let mut fft_rng = ChaCha20Rng::seed_from_u64(0x5150_3635_3533_3620);
+
+        let encrypted_fft = encrypt_rns_raw_with_distribution_ntt_rng(
+            &plaintext,
+            2,
+            ErrorDistribution::DiscreteGaussian { sigma: 3.19 },
+            &secret,
+            &q_plan,
+            &mut fft_rng,
+        );
+
+        let fft_input = RnsCkksCiphertext::new(
+            encrypted_fft,
+            CkksChainState::new(&chain, level, profile.initial_scale()),
+            &chain,
+        );
+
+        let diagonals = PackedFft2DifStageDiagonals::new(
+            shape,
+            PackedFft2Axis::Rows,
+            stage_span,
+            FftDirection::Forward,
+        );
+
+        assert_eq!(diagonals.rotation(), rotation_steps);
+
+        let prepared_fft = PreparedRepeatedPackedFft2DifStage::new(
+            &fft_input,
+            &diagonals,
+            tiles_per_ciphertext,
+            &embedding,
+            &chain,
+            &q_plan,
+        );
+
+        let prepared_q = PreparedRnsNttPlan::new(&q_plan);
+
+        let evaluation_keys = RnsCkksEvaluationKeys::new();
+        let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
+
+        let butterfly_start = std::time::Instant::now();
+
+        let outputs = execute_packed_local_row_stage_cp_hybrid_batch(
+            &[fft_input],
+            &prepared_fft,
+            &evaluator,
+            &rotation_context,
+            &chain,
+            &prepared_q,
+            1,
+        );
+
+        let butterfly_ms = butterfly_start.elapsed().as_millis();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].level(), level + 1);
+
+        let reference = execute_repeated_packed_fft2_dif_stage_pp(
+            &input_slots,
+            &diagonals,
+            tiles_per_ciphertext,
+        );
+
+        let output = &outputs[0];
+        let output_plan = RnsNttPlan::new(output.basis().moduli().to_vec(), N);
+
+        let decrypted = decrypt_rns_raw_with_ntt(output.rlwe(), &secret, &output_plan);
+
+        let modulus = composite_modulus_big(decrypted.basis());
+
+        let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+            .iter()
+            .map(|residue| {
+                centered_representative_big(residue, &modulus)
+                    .to_f64()
+                    .expect("CKKS coefficient conversion failed")
+                    / output.scale()
+            })
+            .collect();
+
+        let decoded = embedding.coefficients_to_slots(&coefficients);
+
+        assert_eq!(decoded.len(), reference.len());
+
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        let mut max_abs_error = 0.0_f64;
+
+        for (actual, expected) in decoded.iter().zip(reference.iter()) {
+            let error = (*actual - *expected).norm();
+
+            squared_error += error * error;
+            squared_reference += expected.norm_sqr();
+            max_abs_error = max_abs_error.max(error);
+        }
+
+        let relative_l2 = (squared_error / squared_reference).sqrt();
+
+        println!(
+            "M1_5H_PACKED_BUTTERFLY_METRICS              level_in={} level_out={} degree={}              tiles={} butterfly_ms={}              rel_l2={:.12e} max_abs={:.12e}",
+            level,
+            output.level(),
+            N,
+            tiles_per_ciphertext,
+            butterfly_ms,
+            relative_l2,
+            max_abs_error,
+        );
+
+        assert!(relative_l2.is_finite());
+        assert!(max_abs_error.is_finite());
+        assert!(
+            relative_l2 <= 5e-3,
+            "degree-65536 packed hybrid butterfly accuracy failed"
+        );
+
+        println!(
+            "M1_5I_STAGE_METRICS level={} span={} rotation={}",
+            level, stage_span, rotation_steps,
+        );
+
+        println!("M1_5H_PACKED_BUTTERFLY_STATUS=PASS");
+    }
+
+    println!(
+        "M1_5C_SINGLE_KEY_STATUS=PASS          degree={} level={} base={} digits={}          p_limbs={} keygen_ms={}",
+        N,
+        level,
+        base_log,
+        key.digit_count(),
+        p.len(),
+        elapsed_ms,
+    );
+}
