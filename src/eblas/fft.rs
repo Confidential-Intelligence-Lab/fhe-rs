@@ -1440,7 +1440,7 @@ pub fn execute_packed_1k_fft_rows_cp(
         chain,
         inter_ct_parallelism,
         local_outer_parallelism,
-        None,
+        (None, None),
     )
 }
 
@@ -1525,18 +1525,53 @@ pub fn execute_packed_1k_fft_rows_cp_cached<'a>(
         chain,
         inter_ct_parallelism,
         local_outer_parallelism,
-        Some(context),
+        (Some(context), None),
     )
 }
 
-fn execute_packed_1k_fft_rows_cp_inner(
+/// Executes the complete 1K row FFT using Gaussian hybrid
+/// rotations for the six local stages.
+///
+/// The four global butterfly stages are shared with the existing
+/// row engine. The caller provisions all required level-specific
+/// hybrid rotation keys before entering this function.
+///
+/// This entry point does not fall back to conventional Galois keys.
+pub fn execute_packed_1k_fft_rows_cp_hybrid_cached<'a>(
+    values: Vec<RnsCkksCiphertext>,
+    evaluator: &RnsCkksEvaluator<'a>,
+    rotations: &PreparedHybridRotationContext<'_>,
+    embedding: &'a CkksCanonicalEmbedding,
+    chain: &'a ModulusChain,
+    parallelism: (usize, usize),
+    context: &mut PackedRowPreparationContext<'a>,
+) -> Vec<RnsCkksCiphertext> {
+    let (inter_ct_parallelism, local_outer_parallelism) = parallelism;
+
+    context.bind(evaluator, embedding, chain);
+
+    execute_packed_1k_fft_rows_cp_inner(
+        values,
+        evaluator,
+        embedding,
+        chain,
+        inter_ct_parallelism,
+        local_outer_parallelism,
+        (Some(context), Some(rotations)),
+    )
+}
+
+fn execute_packed_1k_fft_rows_cp_inner<'a>(
     mut values: Vec<RnsCkksCiphertext>,
-    evaluator: &RnsCkksEvaluator<'_>,
-    embedding: &CkksCanonicalEmbedding,
-    chain: &ModulusChain,
+    evaluator: &RnsCkksEvaluator<'a>,
+    embedding: &'a CkksCanonicalEmbedding,
+    chain: &'a ModulusChain,
     inter_ct_parallelism: usize,
     local_outer_parallelism: usize,
-    mut context: Option<&mut PackedRowPreparationContext>,
+    (mut context, rotations): (
+        Option<&mut PackedRowPreparationContext<'a>>,
+        Option<&PreparedHybridRotationContext<'_>>,
+    ),
 ) -> Vec<RnsCkksCiphertext> {
     const TILE_DIM: usize = 64;
     const TILE_ELEMENTS: usize = TILE_DIM * TILE_DIM;
@@ -1725,6 +1760,36 @@ fn execute_packed_1k_fft_rows_cp_inner(
     /*
      * Six repeated packed local-row stages.
      */
+    if let Some(rotations) = rotations {
+        let shared = context
+            .as_deref_mut()
+            .expect("hybrid 1K row execution requires a preparation context");
+
+        values = execute_packed_local_rows_cp_hybrid_staged_cached(
+            values,
+            (tile_shape, TILES_PER_CIPHERTEXT),
+            evaluator,
+            rotations,
+            embedding,
+            chain,
+            (local_outer_parallelism, shared),
+        );
+
+        assert_eq!(
+            values.len(),
+            CIPHERTEXT_COUNT,
+            "hybrid 1K row output count mismatch"
+        );
+
+        assert_eq!(
+            values[0].level(),
+            start_level + 10,
+            "hybrid 1K row must consume exactly ten CKKS levels"
+        );
+
+        return values;
+    }
+
     let mut span = TILE_DIM;
 
     while span >= 2 {
