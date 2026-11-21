@@ -2150,3 +2150,366 @@ fn degree_65536_gaussian_hybrid_local_column() {
 
     println!("M1_9F_LOCAL_STATUS=PASS");
 }
+
+#[test]
+#[ignore = "full-degree nine-stage Gaussian hybrid column FFT"]
+fn degree_65536_gaussian_hybrid_chained_column() {
+    use crate::application_support::ckks::encode_rns;
+    use crate::ckks::{
+        CkksChainState, PreparedHybridRnsGaloisKey, PreparedHybridRotationContext,
+        RnsCkksEvaluationKeys,
+    };
+    use crate::grafting::{
+        decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
+    };
+    use crate::ring::PreparedRnsNttPlan;
+    use crate::ring::{
+        centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, Modulus,
+        ModulusBasis, RnsNttPlan,
+    };
+    use crate::rlwe::ErrorDistribution;
+    use num_traits::ToPrimitive;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    assert_eq!(
+        std::env::var("FHE_M1_9_ALLOW_FULL_KEYS").as_deref(),
+        Ok("1"),
+        "explicit full-degree experiment opt-in required"
+    );
+
+    const N: usize = 65_536;
+    const START_LEVEL: usize = 11;
+    const FINAL_LEVEL: usize = 20;
+    const STAGE_COUNT: usize = 9;
+    const TILE_COUNT: usize = 8;
+
+    const BASE_LOG: u32 = 55;
+
+    let profile = crate::ckks::research_profile_65536_for_levels(20, 2);
+
+    let chain = profile.modulus_chain();
+    let embedding = CkksCanonicalEmbedding::new(N);
+    let scale = profile.initial_scale();
+
+    let input: Vec<Complex64> = (0..embedding.slot_count())
+        .map(|index| {
+            let tile = index / (64 * 64);
+            let local = index % (64 * 64);
+
+            Complex64::new(
+                (tile + 1) as f64 / 16.0 + (local % 31) as f64 / 512.0,
+                (local % 17) as f64 / 1024.0,
+            )
+        })
+        .collect();
+
+    let mut expected = input.clone();
+
+    let secret: Vec<i8> = (0..N)
+        .map(|index| match index % 4 {
+            0 => -1,
+            1 => 0,
+            2 => 1,
+            _ => 0,
+        })
+        .collect();
+
+    let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+    let q = chain.level(START_LEVEL).clone();
+    let q_plan = RnsNttPlan::new(q.moduli().to_vec(), N);
+
+    let plaintext = encode_rns(&input, &embedding, &q, scale);
+
+    let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x519D_0000);
+
+    let encrypted = encrypt_rns_raw_with_distribution_ntt_rng(
+        &plaintext,
+        2,
+        distribution,
+        &secret,
+        &q_plan,
+        &mut encryption_rng,
+    );
+
+    let ciphertext = RnsCkksCiphertext::new(
+        encrypted,
+        CkksChainState::new(&chain, START_LEVEL, scale),
+        &chain,
+    );
+
+    let evaluation_keys = RnsCkksEvaluationKeys::new();
+    let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
+
+    let tile_shape = Fft2Shape::new(64, 64);
+
+    assert_eq!(TILE_COUNT * tile_shape.elements(), embedding.slot_count());
+
+    let mut current = ciphertext;
+    let mut total_keygen_ms = 0u128;
+    let mut total_execution_ms = 0u128;
+    let mut total_keys = 0usize;
+
+    for stage_index in 0..STAGE_COUNT {
+        let stage_level = START_LEVEL + stage_index;
+
+        assert_eq!(current.level(), stage_level);
+        assert_eq!(current.basis().moduli(), chain.level(stage_level).moduli());
+
+        let stage_q = chain.level(stage_level).clone();
+        let stage_plan = RnsNttPlan::new(stage_q.moduli().to_vec(), N);
+
+        let tile_diagonals = if stage_index < 3 {
+            let span_tiles = 8usize >> stage_index;
+
+            Some(PackedTileDifStageDiagonals::new_column(
+                64,
+                64,
+                TILE_COUNT,
+                span_tiles,
+                FftDirection::Forward,
+            ))
+        } else {
+            None
+        };
+
+        let local_diagonals = if stage_index >= 3 {
+            let span = 64usize >> (stage_index - 3);
+
+            Some(PackedFft2DifStageDiagonals::new(
+                tile_shape,
+                PackedFft2Axis::Columns,
+                span,
+                FftDirection::Forward,
+            ))
+        } else {
+            None
+        };
+
+        let rotation = if let Some(diagonals) = tile_diagonals.as_ref() {
+            expected = execute_packed_tile_dif_stage_pp(&expected, diagonals);
+
+            diagonals.rotation()
+        } else {
+            let diagonals = local_diagonals
+                .as_ref()
+                .expect("missing local-column diagonals");
+
+            expected = execute_repeated_packed_fft2_dif_stage_pp(&expected, diagonals, TILE_COUNT);
+
+            diagonals.rotation()
+        };
+
+        let expected_rotation = if stage_index < 3 {
+            16_384usize >> stage_index
+        } else {
+            2_048usize >> (stage_index - 3)
+        };
+
+        assert_eq!(rotation, expected_rotation);
+
+        let left_exponent = rotation_exponent_left(N, rotation);
+
+        let right_exponent = rotation_exponent_right(N, rotation);
+
+        let auxiliary = ModulusBasis::new(vec![
+            Modulus::new(0x7ffffffbee0001),
+            Modulus::new(0x7ffffffbe40001),
+        ]);
+
+        let mut qp_moduli = stage_q.moduli().to_vec();
+
+        qp_moduli.extend_from_slice(auxiliary.moduli());
+
+        let qp_plan = RnsNttPlan::new(qp_moduli, N);
+
+        let layout = BoundedGadgetLayout::new(stage_q, BASE_LOG);
+
+        let keygen_start = std::time::Instant::now();
+
+        let mut left_rng = ChaCha20Rng::seed_from_u64(0x519D_1000 + stage_index as u64 * 2);
+
+        let left = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+            layout.clone(),
+            auxiliary.clone(),
+            &secret,
+            left_exponent,
+            distribution,
+            2,
+            &qp_plan,
+            &mut left_rng,
+        );
+
+        let right = if right_exponent != left_exponent {
+            let mut right_rng = ChaCha20Rng::seed_from_u64(0x519D_1001 + stage_index as u64 * 2);
+
+            Some(
+                PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                    layout,
+                    auxiliary,
+                    &secret,
+                    right_exponent,
+                    distribution,
+                    2,
+                    &qp_plan,
+                    &mut right_rng,
+                ),
+            )
+        } else {
+            None
+        };
+
+        let keygen_ms = keygen_start.elapsed().as_millis();
+
+        total_keygen_ms += keygen_ms;
+
+        let mut rotations = PreparedHybridRotationContext::new(&chain);
+
+        rotations.insert(stage_level, &left, &qp_plan);
+
+        if let Some(right_key) = right.as_ref() {
+            rotations.insert(stage_level, right_key, &qp_plan);
+        }
+
+        let expected_keys = if stage_index == 0 { 1 } else { 2 };
+
+        assert_eq!(rotations.key_count(), expected_keys);
+
+        total_keys += rotations.key_count();
+
+        let execution_start = std::time::Instant::now();
+
+        let next = if let Some(diagonals) = tile_diagonals.as_ref() {
+            execute_packed_tile_dif_stage_cp_hybrid_context(
+                &current,
+                diagonals,
+                &evaluator,
+                &rotations,
+                &embedding,
+                &chain,
+                &stage_plan,
+            )
+        } else {
+            let diagonals = local_diagonals
+                .as_ref()
+                .expect("missing local-column stage");
+
+            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+
+            let prepared_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &current,
+                diagonals,
+                TILE_COUNT,
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+
+            execute_repeated_packed_fft2_dif_stage_cp_hybrid_context(
+                &current,
+                &prepared_stage,
+                &evaluator,
+                &rotations,
+                &chain,
+                &prepared_plan,
+            )
+        };
+
+        let execution_ms = execution_start.elapsed().as_millis();
+
+        total_execution_ms += execution_ms;
+
+        assert_eq!(next.level(), stage_level + 1);
+
+        assert_eq!(next.basis().moduli(), chain.level(stage_level + 1).moduli());
+
+        println!(
+            "M1_9G_STAGE index={} level_in={} \
+             level_out={} rotation={} keys={} \
+             digits={} keygen_ms={} execution_ms={}",
+            stage_index + 1,
+            stage_level,
+            next.level(),
+            rotation,
+            expected_keys,
+            left.digit_count(),
+            keygen_ms,
+            execution_ms,
+        );
+
+        // Stage-local rotation keys and QP plans are
+        // released at the end of this loop iteration.
+        current = next;
+    }
+
+    assert_eq!(current.level(), FINAL_LEVEL);
+    assert_eq!(total_keys, 17);
+
+    let output = current;
+
+    assert_eq!(output.basis().moduli(), chain.level(FINAL_LEVEL).moduli());
+
+    let output_plan = RnsNttPlan::new(output.basis().moduli().to_vec(), N);
+
+    let decrypted = decrypt_rns_raw_with_ntt(output.rlwe(), &secret, &output_plan);
+
+    let modulus = composite_modulus_big(decrypted.basis());
+
+    let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+        .iter()
+        .map(|residue| {
+            centered_representative_big(residue, &modulus)
+                .to_f64()
+                .expect("CKKS coefficient conversion failed")
+                / output.scale()
+        })
+        .collect();
+
+    let actual = embedding.coefficients_to_slots(&coefficients);
+
+    assert_eq!(actual.len(), expected.len());
+
+    let mut squared_error = 0.0_f64;
+    let mut squared_reference = 0.0_f64;
+    let mut max_abs = 0.0_f64;
+
+    for (actual, reference) in actual.iter().zip(expected.iter()) {
+        let error = (*actual - *reference).norm();
+
+        squared_error += error * error;
+        squared_reference += reference.norm_sqr();
+        max_abs = max_abs.max(error);
+    }
+
+    assert!(squared_reference > 0.0);
+
+    let relative_l2 = (squared_error / squared_reference).sqrt();
+
+    println!(
+        "M1_9G_CHAIN_METRICS degree={} \
+         level_in={} level_out={} stages={} \
+         distinct_stage_keys={} keygen_ms={} \
+         execution_ms={} rel_l2={:.12e} \
+         max_abs={:.12e}",
+        N,
+        START_LEVEL,
+        output.level(),
+        STAGE_COUNT,
+        total_keys,
+        total_keygen_ms,
+        total_execution_ms,
+        relative_l2,
+        max_abs,
+    );
+
+    assert!(relative_l2.is_finite());
+    assert!(max_abs.is_finite());
+
+    assert!(
+        relative_l2 <= 5e-3,
+        "Gaussian hybrid chained column numerical validation failed"
+    );
+
+    println!("M1_9G_CHAIN_STATUS=PASS");
+}
