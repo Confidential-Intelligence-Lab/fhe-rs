@@ -441,7 +441,15 @@ fn main() {
 
     let benchmark_mode = env_flag("R17_1K_BENCHMARK");
 
-    let hybrid_row_only = env_flag("FHE_M1_8_HYBRID_ROW_ONLY");
+    let hybrid_full_fft = env_flag("FHE_M1_9H_HYBRID_FFT2");
+    let hybrid_row_only = env_flag("FHE_M1_8_HYBRID_ROW_ONLY") || hybrid_full_fft;
+
+    if hybrid_full_fft {
+        assert!(
+            env_flag("FHE_M1_9H_ALLOW_FULL_FFT2"),
+            "full hybrid FFT2 requires explicit opt-in"
+        );
+    }
 
     if hybrid_row_only {
         assert!(
@@ -785,6 +793,8 @@ fn main() {
 
     let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
 
+    let mut reported_key_count = distinct_key_count;
+    let mut reported_keygen_ms = keygen_ms;
     let mut hybrid_key_material = Vec::new();
 
     if hybrid_row_only {
@@ -852,11 +862,10 @@ fn main() {
         }
 
         assert_eq!(hybrid_key_material.len(), 6);
+        reported_key_count = hybrid_key_material.len() * 2;
+        reported_keygen_ms = hybrid_start.elapsed().as_millis();
 
-        println!(
-            "M1_8B_HYBRID_KEYGEN_MS={}",
-            hybrid_start.elapsed().as_millis()
-        );
+        println!("M1_8B_HYBRID_KEYGEN_MS={}", reported_keygen_ms);
     }
 
     /*
@@ -974,7 +983,7 @@ fn main() {
         print_checkpoint(level, &values, &clear_values, &secret, &embedding);
     }
 
-    if hybrid_row_only {
+    if hybrid_row_only && !hybrid_full_fft {
         assert_eq!(values.len(), CIPHERTEXT_COUNT);
         assert_eq!(values[0].level(), 10);
 
@@ -1020,201 +1029,386 @@ fn main() {
         return;
     }
 
-    /*
-     * Global column span 16: level 10.
-     */
-    {
-        let stage_start = Instant::now();
+    if hybrid_full_fft {
+        // The completed row phase no longer needs its evaluation
+        // keys. Release them before the memory-intensive column phase.
+        drop(hybrid_key_material);
 
-        let global_span = 16usize * TILE_DIM;
+        assert_eq!(values.len(), CIPHERTEXT_COUNT);
+        assert!(values.iter().all(|ct| ct.level() == 10));
 
-        /*
-         * The level-10 inter-ciphertext column stage uses the same public
-         * twiddle vector for every ciphertext pair. Construct it once and
-         * share it across all workers.
-         */
-        let mut column_twiddles = vec![Complex64::new(0.0, 0.0); SLOT_COUNT];
+        let mut column_keygen_ms = 0u128;
+        let mut column_key_count = 0usize;
+        let column_start = Instant::now();
 
-        for lane in 0..TILES_PER_CIPHERTEXT {
-            let lane_base = lane * TILE_ELEMENTS;
+        let auxiliary = ModulusBasis::new(vec![
+            Modulus::new(0x7ffffffbee0001),
+            Modulus::new(0x7ffffffbe40001),
+        ]);
 
-            for local_row in 0..TILE_DIM {
-                let twiddle_index = lane * TILE_DIM + local_row;
+        let mut provider = |stage_level: usize, rotation: usize| {
+            assert!((11..=19).contains(&stage_level));
 
-                let angle = -2.0 * PI * twiddle_index as f64 / global_span as f64;
+            let expected_rotation = if stage_level <= 13 {
+                16_384usize >> (stage_level - 11)
+            } else {
+                2_048usize >> (stage_level - 14)
+            };
 
-                let w = Complex64::new(angle.cos(), angle.sin());
+            assert_eq!(rotation, expected_rotation);
 
-                for local_col in 0..TILE_DIM {
-                    let tile_slot = local_row * TILE_DIM + local_col;
+            let stage_start = Instant::now();
+            let q = chain.level(stage_level).clone();
 
-                    column_twiddles[lane_base + tile_slot] = w;
-                }
-            }
-        }
+            let mut qp_moduli = q.moduli().to_vec();
+            qp_moduli.extend_from_slice(auxiliary.moduli());
 
-        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
-        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
-        let prepared_column_twiddles = PreparedComplexSlotsCp::new(
-            &values[0],
-            &column_twiddles,
+            let qp_plan = RnsNttPlan::new(qp_moduli, degree);
+            let layout = BoundedGadgetLayout::new(q, 55);
+
+            let left_exponent = rotation_exponent_left(degree, rotation);
+            let right_exponent = rotation_exponent_right(degree, rotation);
+
+            let mut left_rng = ChaCha20Rng::seed_from_u64(0x519D_1000 + stage_level as u64 * 2);
+
+            let left = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                layout.clone(),
+                auxiliary.clone(),
+                &secret,
+                left_exponent,
+                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                2,
+                &qp_plan,
+                &mut left_rng,
+            );
+
+            let right = if right_exponent != left_exponent {
+                let mut right_rng =
+                    ChaCha20Rng::seed_from_u64(0x519D_1001 + stage_level as u64 * 2);
+
+                Some(
+                    PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                        layout,
+                        auxiliary.clone(),
+                        &secret,
+                        right_exponent,
+                        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+                        2,
+                        &qp_plan,
+                        &mut right_rng,
+                    ),
+                )
+            } else {
+                None
+            };
+
+            let keys = 1 + usize::from(right.is_some());
+            column_key_count += keys;
+            column_keygen_ms += stage_start.elapsed().as_millis();
+
+            println!(
+                "M1_9H_KEY_STAGE level={} rotation={} keys={} \
+                 digits={} cumulative_keygen_ms={}",
+                stage_level,
+                rotation,
+                keys,
+                left.digit_count(),
+                column_keygen_ms,
+            );
+
+            io::stdout()
+                .flush()
+                .expect("hybrid column key progress flush failed");
+
+            (left, right, qp_plan)
+        };
+
+        values = ccmm_rs::eblas::fft::execute_packed_1k_fft_columns_cp_hybrid(
+            values,
+            &evaluator,
             &embedding,
             &chain,
-            &stage_plan,
+            inter_ct_parallelism,
+            local_outer_parallelism,
+            &mut provider,
         );
 
-        let stage_input = values;
-        let mut stage_output: Vec<Option<RnsCkksCiphertext>> =
-            (0..CIPHERTEXT_COUNT).map(|_| None).collect();
+        assert_eq!(column_key_count, 17);
+        reported_key_count += column_key_count;
+        reported_keygen_ms += column_keygen_ms;
+        assert_eq!(reported_key_count, 29);
+        assert_eq!(values.len(), CIPHERTEXT_COUNT);
+        assert!(values.iter().all(|ct| ct.level() == REQUIRED_LEVELS));
 
-        let jobs = (0..TILES_PER_AXIS)
-            .map(|tile_col| (tile_col, TILES_PER_AXIS + tile_col))
-            .collect::<Vec<_>>();
-
-        for batch_start in (0..jobs.len()).step_by(inter_ct_parallelism) {
-            let batch_end = (batch_start + inter_ct_parallelism).min(jobs.len());
-
-            let batch = std::thread::scope(|scope| {
-                let mut workers = Vec::new();
-
-                for &(upper_index, lower_index) in &jobs[batch_start..batch_end] {
-                    let a = &stage_input[upper_index];
-                    let b = &stage_input[lower_index];
-
-                    workers.push((
-                        upper_index,
-                        lower_index,
-                        scope.spawn(|| {
-                            packed_fft_dif_butterfly_cp_prepared(
-                                &evaluator,
-                                a,
-                                b,
-                                &prepared_column_twiddles,
-                                &chain,
-                                &prepared_plan,
-                            )
-                        }),
-                    ));
-                }
-
-                workers
-                    .into_iter()
-                    .map(|(upper_index, lower_index, worker)| {
-                        let (upper, lower) =
-                            worker.join().expect("R17 global-column worker panicked");
-
-                        (upper_index, lower_index, upper, lower)
-                    })
-                    .collect::<Vec<_>>()
-            });
-
-            for (upper_index, lower_index, upper, lower) in batch {
-                stage_output[upper_index] = Some(upper);
-                stage_output[lower_index] = Some(lower);
-            }
-        }
-
-        values = stage_output
-            .into_iter()
-            .map(|value| value.expect("R17 global-column output missing"))
-            .collect();
-
+        // Mirror all ten column stages on the original
+        // row-transformed plaintext vectors.
         clear_values = clear_global_column_inter_stage(clear_values);
 
-        level += 1;
+        for span_tiles in [8usize, 4, 2] {
+            let diagonals = PackedTileDifStageDiagonals::new_column(
+                TILE_DIM,
+                TILE_DIM,
+                TILES_PER_CIPHERTEXT,
+                span_tiles,
+                FftDirection::Forward,
+            );
+
+            clear_values = clear_values
+                .iter()
+                .map(|slots| {
+                    ccmm_rs::eblas::fft::execute_packed_tile_dif_stage_pp(slots, &diagonals)
+                })
+                .collect();
+        }
+
+        for span in [64usize, 32, 16, 8, 4, 2] {
+            let diagonals = PackedFft2DifStageDiagonals::new(
+                tile_shape,
+                PackedFft2Axis::Columns,
+                span,
+                FftDirection::Forward,
+            );
+
+            clear_values = clear_values
+                .iter()
+                .map(|slots| {
+                    ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_pp(
+                        slots,
+                        &diagonals,
+                        TILES_PER_CIPHERTEXT,
+                    )
+                })
+                .collect();
+        }
+
+        level = values[0].level();
+
+        // Check the packed column result before the final
+        // physical-image reconstruction and FFT2 comparison.
+        let decoded_column = decrypt_packed_tensor(&values, &secret, &embedding);
+
+        let (column_rel_l2, column_max_abs) = packed_tensor_metrics(&decoded_column, &clear_values);
+
+        assert!(column_rel_l2.is_finite());
+        assert!(column_max_abs.is_finite());
 
         println!(
+            "M1_9H_COLUMN_METRICS ciphertexts={} levels={} \
+             keys={} keygen_ms={} column_wall_ms={} \
+             rel_l2={:.12e} max_abs={:.12e}",
+            values.len(),
+            level,
+            column_key_count,
+            column_keygen_ms,
+            column_start.elapsed().as_millis(),
+            column_rel_l2,
+            column_max_abs,
+        );
+
+        assert!(
+            column_rel_l2 <= TOLERANCE,
+            "full hybrid column numerical validation failed"
+        );
+
+        println!("M1_9H_HYBRID_COLUMN_STATUS=PASS");
+    } else {
+        /*
+         * Global column span 16: level 10.
+         */
+        {
+            let stage_start = Instant::now();
+
+            let global_span = 16usize * TILE_DIM;
+
+            /*
+             * The level-10 inter-ciphertext column stage uses the same public
+             * twiddle vector for every ciphertext pair. Construct it once and
+             * share it across all workers.
+             */
+            let mut column_twiddles = vec![Complex64::new(0.0, 0.0); SLOT_COUNT];
+
+            for lane in 0..TILES_PER_CIPHERTEXT {
+                let lane_base = lane * TILE_ELEMENTS;
+
+                for local_row in 0..TILE_DIM {
+                    let twiddle_index = lane * TILE_DIM + local_row;
+
+                    let angle = -2.0 * PI * twiddle_index as f64 / global_span as f64;
+
+                    let w = Complex64::new(angle.cos(), angle.sin());
+
+                    for local_col in 0..TILE_DIM {
+                        let tile_slot = local_row * TILE_DIM + local_col;
+
+                        column_twiddles[lane_base + tile_slot] = w;
+                    }
+                }
+            }
+
+            let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+            let prepared_column_twiddles = PreparedComplexSlotsCp::new(
+                &values[0],
+                &column_twiddles,
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+
+            let stage_input = values;
+            let mut stage_output: Vec<Option<RnsCkksCiphertext>> =
+                (0..CIPHERTEXT_COUNT).map(|_| None).collect();
+
+            let jobs = (0..TILES_PER_AXIS)
+                .map(|tile_col| (tile_col, TILES_PER_AXIS + tile_col))
+                .collect::<Vec<_>>();
+
+            for batch_start in (0..jobs.len()).step_by(inter_ct_parallelism) {
+                let batch_end = (batch_start + inter_ct_parallelism).min(jobs.len());
+
+                let batch = std::thread::scope(|scope| {
+                    let mut workers = Vec::new();
+
+                    for &(upper_index, lower_index) in &jobs[batch_start..batch_end] {
+                        let a = &stage_input[upper_index];
+                        let b = &stage_input[lower_index];
+
+                        workers.push((
+                            upper_index,
+                            lower_index,
+                            scope.spawn(|| {
+                                packed_fft_dif_butterfly_cp_prepared(
+                                    &evaluator,
+                                    a,
+                                    b,
+                                    &prepared_column_twiddles,
+                                    &chain,
+                                    &prepared_plan,
+                                )
+                            }),
+                        ));
+                    }
+
+                    workers
+                        .into_iter()
+                        .map(|(upper_index, lower_index, worker)| {
+                            let (upper, lower) =
+                                worker.join().expect("R17 global-column worker panicked");
+
+                            (upper_index, lower_index, upper, lower)
+                        })
+                        .collect::<Vec<_>>()
+                });
+
+                for (upper_index, lower_index, upper, lower) in batch {
+                    stage_output[upper_index] = Some(upper);
+                    stage_output[lower_index] = Some(lower);
+                }
+            }
+
+            values = stage_output
+                .into_iter()
+                .map(|value| value.expect("R17 global-column output missing"))
+                .collect();
+
+            clear_values = clear_global_column_inter_stage(clear_values);
+
+            level += 1;
+
+            println!(
             "R17_1K_STAGE level={} kind=global-column span_tiles=16 mode=inter-ct limbs={} elapsed_ms={}",
             level,
             values[0].basis().len(),
             stage_start.elapsed().as_millis()
         );
-    }
-
-    assert_eq!(level, 11);
-
-    if !benchmark_mode {
-        print_checkpoint(level, &values, &clear_values, &secret, &embedding);
-    }
-
-    /*
-     * Global column intra-CT tile-block stages: levels 11..13.
-     */
-    span_tiles = 8;
-
-    while span_tiles >= 2 {
-        let stage_start = Instant::now();
-
-        let diagonals = PackedTileDifStageDiagonals::new_column(
-            TILE_DIM,
-            TILE_DIM,
-            TILES_PER_CIPHERTEXT,
-            span_tiles,
-            FftDirection::Forward,
-        );
-
-        let rotation = diagonals.rotation();
-
-        let left_exponent = rotation_exponent_left(degree, rotation);
-
-        let right_exponent = rotation_exponent_right(degree, rotation);
-
-        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
-
-        let state = values[0].state();
-
-        let prepared_left = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(state, left_exponent),
-            &stage_plan,
-        );
-
-        let prepared_right = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(state, right_exponent),
-            &stage_plan,
-        );
-
-        let stage_input = values;
-        let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
-
-        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
-            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
-
-            let batch = std::thread::scope(|scope| {
-                let mut workers = Vec::new();
-
-                for input in stage_input.iter().take(batch_end).skip(batch_start) {
-                    workers.push(scope.spawn(|| {
-                        execute_packed_tile_dif_stage_cp_prepared(
-                            input,
-                            &diagonals,
-                            &evaluator,
-                            (&prepared_left, &prepared_right),
-                            &embedding,
-                            &chain,
-                            &stage_plan,
-                        )
-                    }));
-                }
-
-                workers
-                    .into_iter()
-                    .map(|worker| worker.join().expect("R17 tile-block worker panicked"))
-                    .collect::<Vec<_>>()
-            });
-
-            stage_output.extend(batch);
         }
 
-        values = stage_output;
+        assert_eq!(level, 11);
 
-        clear_values = clear_values
-            .iter()
-            .map(|value| ccmm_rs::eblas::fft::execute_packed_tile_dif_stage_pp(value, &diagonals))
-            .collect();
+        if !benchmark_mode {
+            print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+        }
 
-        level += 1;
+        /*
+         * Global column intra-CT tile-block stages: levels 11..13.
+         */
+        span_tiles = 8;
 
-        println!(
+        while span_tiles >= 2 {
+            let stage_start = Instant::now();
+
+            let diagonals = PackedTileDifStageDiagonals::new_column(
+                TILE_DIM,
+                TILE_DIM,
+                TILES_PER_CIPHERTEXT,
+                span_tiles,
+                FftDirection::Forward,
+            );
+
+            let rotation = diagonals.rotation();
+
+            let left_exponent = rotation_exponent_left(degree, rotation);
+
+            let right_exponent = rotation_exponent_right(degree, rotation);
+
+            let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+
+            let state = values[0].state();
+
+            let prepared_left = PreparedRnsGaloisKey::new(
+                evaluator.keys().galois_for(state, left_exponent),
+                &stage_plan,
+            );
+
+            let prepared_right = PreparedRnsGaloisKey::new(
+                evaluator.keys().galois_for(state, right_exponent),
+                &stage_plan,
+            );
+
+            let stage_input = values;
+            let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
+
+            for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+                let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
+
+                let batch = std::thread::scope(|scope| {
+                    let mut workers = Vec::new();
+
+                    for input in stage_input.iter().take(batch_end).skip(batch_start) {
+                        workers.push(scope.spawn(|| {
+                            execute_packed_tile_dif_stage_cp_prepared(
+                                input,
+                                &diagonals,
+                                &evaluator,
+                                (&prepared_left, &prepared_right),
+                                &embedding,
+                                &chain,
+                                &stage_plan,
+                            )
+                        }));
+                    }
+
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.join().expect("R17 tile-block worker panicked"))
+                        .collect::<Vec<_>>()
+                });
+
+                stage_output.extend(batch);
+            }
+
+            values = stage_output;
+
+            clear_values = clear_values
+                .iter()
+                .map(|value| {
+                    ccmm_rs::eblas::fft::execute_packed_tile_dif_stage_pp(value, &diagonals)
+                })
+                .collect();
+
+            level += 1;
+
+            println!(
             "R17_1K_STAGE level={} kind=global-column span_tiles={} mode=intra-ct rotation={} limbs={} elapsed_ms={}",
             level,
             span_tiles,
@@ -1223,110 +1417,110 @@ fn main() {
             stage_start.elapsed().as_millis()
         );
 
-        io::stdout().flush().expect("R17 stage output must flush");
+            io::stdout().flush().expect("R17 stage output must flush");
 
-        span_tiles /= 2;
-    }
-
-    assert_eq!(level, 14);
-
-    if !benchmark_mode {
-        print_checkpoint(level, &values, &clear_values, &secret, &embedding);
-    }
-
-    /*
-     * Local column stages: levels 14..19.
-     */
-    span = TILE_DIM;
-
-    while span >= 2 {
-        let stage_start = Instant::now();
-
-        let diagonals = PackedFft2DifStageDiagonals::new(
-            tile_shape,
-            PackedFft2Axis::Columns,
-            span,
-            FftDirection::Forward,
-        );
-
-        let rotation = diagonals.rotation();
-
-        let left_exponent = rotation_exponent_left(degree, rotation);
-
-        let right_exponent = rotation_exponent_right(degree, rotation);
-
-        let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
-
-        let state = values[0].state();
-
-        let prepared_left = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(state, left_exponent),
-            &stage_plan,
-        );
-
-        let prepared_right = PreparedRnsGaloisKey::new(
-            evaluator.keys().galois_for(state, right_exponent),
-            &stage_plan,
-        );
-
-        let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
-        let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
-            &values[0],
-            &diagonals,
-            TILES_PER_CIPHERTEXT,
-            &embedding,
-            &chain,
-            &stage_plan,
-        );
-
-        let stage_input = values;
-        let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
-
-        for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
-            let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
-
-            let batch = std::thread::scope(|scope| {
-                let mut workers = Vec::new();
-
-                for input in stage_input.iter().take(batch_end).skip(batch_start) {
-                    workers.push(scope.spawn(|| {
-                        execute_repeated_packed_fft2_dif_stage_cp_prepared(
-                            input,
-                            &prepared_fft_stage,
-                            &evaluator,
-                            (&prepared_left, &prepared_right),
-                            &chain,
-                            &stage_plan,
-                            &prepared_plan,
-                        )
-                    }));
-                }
-
-                workers
-                    .into_iter()
-                    .map(|worker| worker.join().expect("R17 local-column worker panicked"))
-                    .collect::<Vec<_>>()
-            });
-
-            stage_output.extend(batch);
+            span_tiles /= 2;
         }
 
-        values = stage_output;
+        assert_eq!(level, 14);
 
-        clear_values = clear_values
-            .iter()
-            .map(|value| {
-                ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_pp(
-                    value,
-                    &diagonals,
-                    TILES_PER_CIPHERTEXT,
-                )
-            })
-            .collect();
+        if !benchmark_mode {
+            print_checkpoint(level, &values, &clear_values, &secret, &embedding);
+        }
 
-        level += 1;
+        /*
+         * Local column stages: levels 14..19.
+         */
+        span = TILE_DIM;
 
-        println!(
+        while span >= 2 {
+            let stage_start = Instant::now();
+
+            let diagonals = PackedFft2DifStageDiagonals::new(
+                tile_shape,
+                PackedFft2Axis::Columns,
+                span,
+                FftDirection::Forward,
+            );
+
+            let rotation = diagonals.rotation();
+
+            let left_exponent = rotation_exponent_left(degree, rotation);
+
+            let right_exponent = rotation_exponent_right(degree, rotation);
+
+            let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+
+            let state = values[0].state();
+
+            let prepared_left = PreparedRnsGaloisKey::new(
+                evaluator.keys().galois_for(state, left_exponent),
+                &stage_plan,
+            );
+
+            let prepared_right = PreparedRnsGaloisKey::new(
+                evaluator.keys().galois_for(state, right_exponent),
+                &stage_plan,
+            );
+
+            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &values[0],
+                &diagonals,
+                TILES_PER_CIPHERTEXT,
+                &embedding,
+                &chain,
+                &stage_plan,
+            );
+
+            let stage_input = values;
+            let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
+
+            for batch_start in (0..CIPHERTEXT_COUNT).step_by(local_outer_parallelism) {
+                let batch_end = (batch_start + local_outer_parallelism).min(CIPHERTEXT_COUNT);
+
+                let batch = std::thread::scope(|scope| {
+                    let mut workers = Vec::new();
+
+                    for input in stage_input.iter().take(batch_end).skip(batch_start) {
+                        workers.push(scope.spawn(|| {
+                            execute_repeated_packed_fft2_dif_stage_cp_prepared(
+                                input,
+                                &prepared_fft_stage,
+                                &evaluator,
+                                (&prepared_left, &prepared_right),
+                                &chain,
+                                &stage_plan,
+                                &prepared_plan,
+                            )
+                        }));
+                    }
+
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.join().expect("R17 local-column worker panicked"))
+                        .collect::<Vec<_>>()
+                });
+
+                stage_output.extend(batch);
+            }
+
+            values = stage_output;
+
+            clear_values = clear_values
+                .iter()
+                .map(|value| {
+                    ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_pp(
+                        value,
+                        &diagonals,
+                        TILES_PER_CIPHERTEXT,
+                    )
+                })
+                .collect();
+
+            level += 1;
+
+            println!(
             "R17_1K_STAGE level={} kind=local-column span={} rotation={} limbs={} elapsed_ms={}",
             level,
             span,
@@ -1335,9 +1529,10 @@ fn main() {
             stage_start.elapsed().as_millis()
         );
 
-        io::stdout().flush().expect("R17 stage output must flush");
+            io::stdout().flush().expect("R17 stage output must flush");
 
-        span /= 2;
+            span /= 2;
+        }
     }
 
     assert_eq!(level, REQUIRED_LEVELS);
@@ -1382,9 +1577,9 @@ fn main() {
     println!("R17_1K_SLOT_UTILIZATION=1.000000");
     println!("R17_1K_TOTAL_LEVELS={level}");
     println!("R17_1K_FINAL_LIMBS={}", values[0].basis().len());
-    println!("R17_1K_GALOIS_KEY_COUNT={distinct_key_count}");
+    println!("R17_1K_GALOIS_KEY_COUNT={reported_key_count}");
     println!("R17_1K_ENCRYPTION_MS={encryption_ms}");
-    println!("R17_1K_KEYGEN_MS={keygen_ms}");
+    println!("R17_1K_KEYGEN_MS={reported_keygen_ms}");
     println!("R17_1K_FFT_MS={fft_ms}");
     println!("R17_1K_DECRYPT_MS={decrypt_ms}");
     println!("R17_1K_TOTAL_MS={total_ms}");
