@@ -3411,6 +3411,115 @@ pub fn execute_packed_tile_dif_stage_cp_prepared(
     evaluator.add(&partial, &right_term)
 }
 
+/// Executes one packed tile-block DIF stage with Gaussian hybrid
+/// QP rotations.
+///
+/// Uses the level-indexed hybrid rotation context for both Galois
+/// automorphisms. All public diagonal multiplications, rescaling,
+/// and evaluator additions retain the prepared tile-block semantics.
+///
+/// A missing hybrid evaluation key causes an explicit failure.
+/// No conventional Galois-key fallback is permitted.
+pub fn execute_packed_tile_dif_stage_cp_hybrid_context(
+    input: &RnsCkksCiphertext,
+    diagonals: &PackedTileDifStageDiagonals,
+    evaluator: &RnsCkksEvaluator<'_>,
+    rotations: &PreparedHybridRotationContext<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    plan: &RnsNttPlan,
+) -> RnsCkksCiphertext {
+    input.assert_matches_chain(chain);
+
+    let slot_count = embedding.slot_count();
+    let logical_length = diagonals
+        .packed_tiles()
+        .checked_mul(diagonals.tile_elements())
+        .expect("packed tile DIF logical length overflow");
+
+    assert_eq!(
+        logical_length, slot_count,
+        "packed tile DIF layout must occupy the complete CKKS slot vector"
+    );
+    assert_eq!(
+        embedding.degree(),
+        input.rlwe().degree(),
+        "packed tile DIF embedding degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.degree(),
+        input.rlwe().degree(),
+        "packed tile DIF NTT plan degree must match ciphertext ring degree"
+    );
+    assert_eq!(
+        plan.moduli(),
+        input.basis().moduli(),
+        "packed tile DIF NTT plan basis must match ciphertext basis"
+    );
+
+    let rotation = diagonals.rotation();
+
+    assert!(
+        rotation > 0 && rotation < slot_count,
+        "packed tile DIF rotation must lie inside the CKKS slot vector"
+    );
+
+    let (rotated_left, rotated_right) = std::thread::scope(|scope| {
+        let left_worker = scope.spawn(|| rotations.rotate_left(input, rotation));
+
+        let right_worker = scope.spawn(|| rotations.rotate_right(input, rotation));
+
+        (
+            left_worker
+                .join()
+                .expect("packed tile DIF prepared left rotation worker panicked"),
+            right_worker
+                .join()
+                .expect("packed tile DIF prepared right rotation worker panicked"),
+        )
+    });
+
+    let (direct_term, left_term, right_term) = std::thread::scope(|scope| {
+        let direct_worker = scope
+            .spawn(|| multiply_complex_slots_cp(input, diagonals.direct(), embedding, chain, plan));
+
+        let left_worker = scope.spawn(|| {
+            multiply_complex_slots_cp(
+                &rotated_left,
+                diagonals.rotate_left(),
+                embedding,
+                chain,
+                plan,
+            )
+        });
+
+        let right_worker = scope.spawn(|| {
+            multiply_complex_slots_cp(
+                &rotated_right,
+                diagonals.rotate_right(),
+                embedding,
+                chain,
+                plan,
+            )
+        });
+
+        (
+            direct_worker
+                .join()
+                .expect("packed tile DIF prepared direct CP worker panicked"),
+            left_worker
+                .join()
+                .expect("packed tile DIF prepared left CP worker panicked"),
+            right_worker
+                .join()
+                .expect("packed tile DIF prepared right CP worker panicked"),
+        )
+    });
+
+    let partial = evaluator.add(&direct_term, &left_term);
+    evaluator.add(&partial, &right_term)
+}
+
 /// Executes one packed cleartext FFT2 DIF stage using the same
 /// diagonal-times-rotation algebra required by the encrypted realization.
 pub fn execute_packed_fft2_dif_stage_pp(

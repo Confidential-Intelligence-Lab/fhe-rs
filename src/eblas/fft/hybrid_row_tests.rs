@@ -1637,3 +1637,232 @@ fn degree_65536_six_stage_hybrid_row_fft() {
 
     println!("M1_6_SIX_STAGE_STATUS=PASS");
 }
+
+#[test]
+#[ignore = "full-degree Gaussian hybrid tile-block integration"]
+fn degree_65536_gaussian_hybrid_tile_block() {
+    use crate::application_support::ckks::encode_rns;
+    use crate::ckks::{
+        CkksChainState, PreparedHybridRnsGaloisKey, PreparedHybridRotationContext,
+        RnsCkksEvaluationKeys,
+    };
+    use crate::grafting::{
+        decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
+    };
+    use crate::ring::{
+        centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, Modulus,
+        ModulusBasis, RnsNttPlan,
+    };
+    use crate::rlwe::ErrorDistribution;
+    use num_traits::ToPrimitive;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    assert_eq!(
+        std::env::var("FHE_M1_9_ALLOW_FULL_KEYS").as_deref(),
+        Ok("1"),
+        "explicit full-degree experiment opt-in required"
+    );
+
+    const N: usize = 65_536;
+    const LEVEL: usize = 11;
+    const BASE_LOG: u32 = 55;
+
+    let profile = crate::ckks::research_profile_65536_for_levels(20, 2);
+
+    let chain = profile.modulus_chain();
+    let embedding = CkksCanonicalEmbedding::new(N);
+    let scale = profile.initial_scale();
+
+    let diagonals = PackedTileDifStageDiagonals::new_column(64, 64, 8, 8, FftDirection::Forward);
+
+    assert_eq!(diagonals.rotation(), 16_384);
+    assert_eq!(
+        diagonals.packed_tiles() * diagonals.tile_elements(),
+        embedding.slot_count()
+    );
+
+    let input: Vec<Complex64> = (0..embedding.slot_count())
+        .map(|index| {
+            let tile = index / (64 * 64);
+            let local = index % (64 * 64);
+
+            Complex64::new(
+                (tile + 1) as f64 / 16.0 + (local % 31) as f64 / 512.0,
+                (local % 17) as f64 / 1024.0,
+            )
+        })
+        .collect();
+
+    let expected = execute_packed_tile_dif_stage_pp(&input, &diagonals);
+
+    let secret: Vec<i8> = (0..N)
+        .map(|index| match index % 4 {
+            0 => -1,
+            1 => 0,
+            2 => 1,
+            _ => 0,
+        })
+        .collect();
+
+    let distribution = ErrorDistribution::DiscreteGaussian { sigma: 3.19 };
+
+    let q = chain.level(LEVEL).clone();
+    let q_plan = RnsNttPlan::new(q.moduli().to_vec(), N);
+
+    let plaintext = encode_rns(&input, &embedding, &q, scale);
+
+    let mut encryption_rng = ChaCha20Rng::seed_from_u64(0x519D_0000);
+
+    let encrypted = encrypt_rns_raw_with_distribution_ntt_rng(
+        &plaintext,
+        2,
+        distribution,
+        &secret,
+        &q_plan,
+        &mut encryption_rng,
+    );
+
+    let ciphertext =
+        RnsCkksCiphertext::new(encrypted, CkksChainState::new(&chain, LEVEL, scale), &chain);
+
+    let auxiliary = ModulusBasis::new(vec![
+        Modulus::new(0x7ffffffbee0001),
+        Modulus::new(0x7ffffffbe40001),
+    ]);
+
+    let mut qp_moduli = q.moduli().to_vec();
+    qp_moduli.extend_from_slice(auxiliary.moduli());
+
+    let qp_plan = RnsNttPlan::new(qp_moduli, N);
+
+    let rotation = diagonals.rotation();
+    let left_exponent = rotation_exponent_left(N, rotation);
+    let right_exponent = rotation_exponent_right(N, rotation);
+
+    assert_eq!(
+        left_exponent, right_exponent,
+        "half-slot rotation must share one Galois exponent"
+    );
+
+    let layout = BoundedGadgetLayout::new(q, BASE_LOG);
+
+    let keygen_start = std::time::Instant::now();
+
+    let mut left_rng = ChaCha20Rng::seed_from_u64(0x519D_1000);
+
+    let left = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+        layout.clone(),
+        auxiliary.clone(),
+        &secret,
+        left_exponent,
+        distribution,
+        2,
+        &qp_plan,
+        &mut left_rng,
+    );
+
+    let mut right_rng = ChaCha20Rng::seed_from_u64(0x519D_1001);
+
+    let right = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+        layout,
+        auxiliary,
+        &secret,
+        right_exponent,
+        distribution,
+        2,
+        &qp_plan,
+        &mut right_rng,
+    );
+
+    let keygen_ms = keygen_start.elapsed().as_millis();
+
+    let mut rotations = PreparedHybridRotationContext::new(&chain);
+
+    rotations.insert(LEVEL, &left, &qp_plan);
+
+    if right.exponent() != left.exponent() {
+        rotations.insert(LEVEL, &right, &qp_plan);
+    }
+
+    let evaluation_keys = RnsCkksEvaluationKeys::new();
+    let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
+
+    let execute_start = std::time::Instant::now();
+
+    let output = execute_packed_tile_dif_stage_cp_hybrid_context(
+        &ciphertext,
+        &diagonals,
+        &evaluator,
+        &rotations,
+        &embedding,
+        &chain,
+        &q_plan,
+    );
+
+    let execution_ms = execute_start.elapsed().as_millis();
+
+    assert_eq!(output.level(), LEVEL + 1);
+
+    let output_plan = RnsNttPlan::new(output.basis().moduli().to_vec(), N);
+
+    let decrypted = decrypt_rns_raw_with_ntt(output.rlwe(), &secret, &output_plan);
+
+    let modulus = composite_modulus_big(decrypted.basis());
+
+    let coefficients: Vec<f64> = reconstruct_coefficients_big(&decrypted)
+        .iter()
+        .map(|residue| {
+            centered_representative_big(residue, &modulus)
+                .to_f64()
+                .expect("CKKS coefficient conversion failed")
+                / output.scale()
+        })
+        .collect();
+
+    let actual = embedding.coefficients_to_slots(&coefficients);
+
+    assert_eq!(actual.len(), expected.len());
+
+    let mut squared_error = 0.0_f64;
+    let mut squared_reference = 0.0_f64;
+    let mut max_abs = 0.0_f64;
+
+    for (actual, reference) in actual.iter().zip(expected.iter()) {
+        let error = (*actual - *reference).norm();
+
+        squared_error += error * error;
+        squared_reference += reference.norm_sqr();
+        max_abs = max_abs.max(error);
+    }
+
+    assert!(squared_reference > 0.0);
+
+    let relative_l2 = (squared_error / squared_reference).sqrt();
+
+    println!(
+        "M1_9D_TILE_METRICS degree={} \
+         level_in={} level_out={} rotation={} \
+         digits={} keygen_ms={} execution_ms={} \
+         rel_l2={:.12e} max_abs={:.12e}",
+        N,
+        LEVEL,
+        output.level(),
+        rotation,
+        left.digit_count(),
+        keygen_ms,
+        execution_ms,
+        relative_l2,
+        max_abs,
+    );
+
+    assert!(relative_l2.is_finite());
+    assert!(max_abs.is_finite());
+
+    assert!(
+        relative_l2 <= 5e-3,
+        "Gaussian hybrid tile-block numerical validation failed"
+    );
+
+    println!("M1_9D_TILE_STATUS=PASS");
+}
