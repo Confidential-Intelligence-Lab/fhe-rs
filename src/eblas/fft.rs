@@ -2435,8 +2435,10 @@ pub fn execute_packed_1k_fft_columns_cp(
 ///
 /// The input level advances by exactly ten CKKS levels. No conventional
 /// Galois-key fallback is used for intra-ciphertext rotations.
+/// Executes the packed 1K Gaussian hybrid column FFT with
+/// stage-local, owned rotation keys.
 pub fn execute_packed_1k_fft_columns_cp_hybrid<F>(
-    mut values: Vec<RnsCkksCiphertext>,
+    values: Vec<RnsCkksCiphertext>,
     evaluator: &RnsCkksEvaluator<'_>,
     embedding: &CkksCanonicalEmbedding,
     chain: &ModulusChain,
@@ -2453,6 +2455,80 @@ where
         Option<PreparedHybridRnsGaloisKey>,
         RnsNttPlan,
     ),
+{
+    let degree = embedding.degree();
+
+    execute_packed_1k_fft_columns_cp_hybrid_with_stage_context(
+        values,
+        evaluator,
+        embedding,
+        chain,
+        inter_ct_parallelism,
+        local_outer_parallelism,
+        &mut |level, rotation, execute| {
+            with_packed_column_hybrid_stage_keys(
+                level,
+                rotation,
+                degree,
+                chain,
+                provider,
+                |rotations| execute(rotations),
+            )
+        },
+    )
+}
+
+/// Executes the same Gaussian hybrid column FFT using borrowed
+/// level-specific keys and QP NTT plans.
+///
+/// The caller retains ownership of all nine column-stage key sets.
+/// No keys are generated or cloned by this entry point.
+pub fn execute_packed_1k_fft_columns_cp_hybrid_borrowed(
+    values: Vec<RnsCkksCiphertext>,
+    evaluator: &RnsCkksEvaluator<'_>,
+    rotations: &PreparedHybridRotationContext<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    inter_ct_parallelism: usize,
+    local_outer_parallelism: usize,
+) -> Vec<RnsCkksCiphertext> {
+    let degree = embedding.degree();
+
+    execute_packed_1k_fft_columns_cp_hybrid_with_stage_context(
+        values,
+        evaluator,
+        embedding,
+        chain,
+        inter_ct_parallelism,
+        local_outer_parallelism,
+        &mut |level, rotation, execute| {
+            let left = rotation_exponent_left(degree, rotation);
+            let right = rotation_exponent_right(degree, rotation);
+
+            // Fail closed if either level-specific key is missing.
+            let _ = rotations.key_for_level(level, left);
+            let _ = rotations.key_for_level(level, right);
+
+            execute(rotations)
+        },
+    )
+}
+
+fn execute_packed_1k_fft_columns_cp_hybrid_with_stage_context<F>(
+    mut values: Vec<RnsCkksCiphertext>,
+    evaluator: &RnsCkksEvaluator<'_>,
+    embedding: &CkksCanonicalEmbedding,
+    chain: &ModulusChain,
+    inter_ct_parallelism: usize,
+    local_outer_parallelism: usize,
+    with_stage: &mut F,
+) -> Vec<RnsCkksCiphertext>
+where
+    F: FnMut(
+        usize,
+        usize,
+        &mut dyn for<'a, 'b> FnMut(&'b PreparedHybridRotationContext<'a>) -> Vec<RnsCkksCiphertext>,
+    ) -> Vec<RnsCkksCiphertext>,
 {
     const TILE_DIM: usize = 64;
     const TILE_ELEMENTS: usize = TILE_DIM * TILE_DIM;
@@ -2610,48 +2686,41 @@ where
         let rotation = diagonals.rotation();
         let stage_input = values;
 
-        values = with_packed_column_hybrid_stage_keys(
-            level,
-            rotation,
-            degree,
-            chain,
-            provider,
-            |rotations| {
-                let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+        values = with_stage(level, rotation, &mut |rotations| {
+            let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
 
-                let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
+            let mut stage_output = Vec::with_capacity(CIPHERTEXT_COUNT);
 
-                for chunk in stage_input.chunks(local_outer_parallelism) {
-                    let batch = std::thread::scope(|scope| {
-                        let workers = chunk
-                            .iter()
-                            .map(|input| {
-                                scope.spawn(|| {
-                                    execute_packed_tile_dif_stage_cp_hybrid_context(
-                                        input,
-                                        &diagonals,
-                                        evaluator,
-                                        rotations,
-                                        embedding,
-                                        chain,
-                                        &stage_plan,
-                                    )
-                                })
+            for chunk in stage_input.chunks(local_outer_parallelism) {
+                let batch = std::thread::scope(|scope| {
+                    let workers = chunk
+                        .iter()
+                        .map(|input| {
+                            scope.spawn(|| {
+                                execute_packed_tile_dif_stage_cp_hybrid_context(
+                                    input,
+                                    &diagonals,
+                                    evaluator,
+                                    rotations,
+                                    embedding,
+                                    chain,
+                                    &stage_plan,
+                                )
                             })
-                            .collect::<Vec<_>>();
+                        })
+                        .collect::<Vec<_>>();
 
-                        workers
-                            .into_iter()
-                            .map(|worker| worker.join().expect("hybrid tile-block worker panicked"))
-                            .collect::<Vec<_>>()
-                    });
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.join().expect("hybrid tile-block worker panicked"))
+                        .collect::<Vec<_>>()
+                });
 
-                    stage_output.extend(batch);
-                }
+                stage_output.extend(batch);
+            }
 
-                stage_output
-            },
-        );
+            stage_output
+        });
 
         assert_eq!(values.len(), CIPHERTEXT_COUNT);
         assert!(
@@ -2685,37 +2754,30 @@ where
         let rotation = diagonals.rotation();
         let stage_input = values;
 
-        values = with_packed_column_hybrid_stage_keys(
-            level,
-            rotation,
-            degree,
-            chain,
-            provider,
-            |rotations| {
-                let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+        values = with_stage(level, rotation, &mut |rotations| {
+            let stage_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
 
-                let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
+            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
 
-                let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
-                    &stage_input[0],
-                    &diagonals,
-                    TILES_PER_CIPHERTEXT,
-                    embedding,
-                    chain,
-                    &stage_plan,
-                );
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &stage_input[0],
+                &diagonals,
+                TILES_PER_CIPHERTEXT,
+                embedding,
+                chain,
+                &stage_plan,
+            );
 
-                execute_packed_local_row_stage_cp_hybrid_batch(
-                    &stage_input,
-                    &prepared_fft_stage,
-                    evaluator,
-                    rotations,
-                    chain,
-                    &prepared_plan,
-                    local_outer_parallelism,
-                )
-            },
-        );
+            execute_packed_local_row_stage_cp_hybrid_batch(
+                &stage_input,
+                &prepared_fft_stage,
+                evaluator,
+                rotations,
+                chain,
+                &prepared_plan,
+                local_outer_parallelism,
+            )
+        });
 
         assert_eq!(values.len(), CIPHERTEXT_COUNT);
         assert!(
