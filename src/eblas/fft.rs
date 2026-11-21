@@ -1328,6 +1328,9 @@ pub fn packed_fft_dif_butterfly_cp_prepared(
 #[derive(Default)]
 pub struct PackedRowPreparationContext<'a> {
     local_stages: Vec<Option<PreparedLocalRowStage>>,
+    hybrid_stages: Vec<Option<HybridPreparedLocalRowStage>>,
+    hybrid_preparations: usize,
+    hybrid_hits: usize,
     binding: Option<(
         &'a crate::ckks::RnsCkksEvaluationKeys,
         &'a ModulusChain,
@@ -1345,10 +1348,23 @@ struct PreparedLocalRowStage {
     prepared_fft_stage: PreparedRepeatedPackedFft2DifStage,
 }
 
+struct HybridPreparedLocalRowStage {
+    state: crate::ckks::CkksChainState,
+    span: usize,
+    tile_shape: Fft2Shape,
+    tiles_per_ciphertext: usize,
+    stage_plan: RnsNttPlan,
+    prepared_plan: PreparedRnsNttPlan,
+    prepared_fft_stage: PreparedRepeatedPackedFft2DifStage,
+}
+
 impl<'a> PackedRowPreparationContext<'a> {
     pub fn new() -> Self {
         Self {
             local_stages: (0..6).map(|_| None).collect(),
+            hybrid_stages: (0..6).map(|_| None).collect(),
+            hybrid_preparations: 0,
+            hybrid_hits: 0,
             binding: None,
         }
     }
@@ -1375,7 +1391,8 @@ impl<'a> PackedRowPreparationContext<'a> {
             }
             None => {
                 assert!(
-                    self.local_stages.iter().all(Option::is_none),
+                    self.local_stages.iter().all(Option::is_none)
+                        && self.hybrid_stages.iter().all(Option::is_none),
                     "unbound row cache contains prepared stages"
                 );
                 self.binding = Some((evaluator.keys(), chain, embedding));
@@ -1427,6 +1444,25 @@ pub fn execute_packed_1k_fft_rows_cp(
     )
 }
 
+fn prepare_row_stage_diagonals(tile_shape: Fft2Shape, span: usize) -> PackedFft2DifStageDiagonals {
+    PackedFft2DifStageDiagonals::new(
+        tile_shape,
+        PackedFft2Axis::Rows,
+        span,
+        FftDirection::Forward,
+    )
+}
+
+fn prepare_row_stage_ntt(
+    level: usize,
+    degree: usize,
+    chain: &ModulusChain,
+) -> (RnsNttPlan, PreparedRnsNttPlan) {
+    let plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
+    let prepared = PreparedRnsNttPlan::new(&plan);
+    (plan, prepared)
+}
+
 fn prepare_local_row_stage(
     input: &RnsCkksCiphertext,
     span: usize,
@@ -1436,17 +1472,12 @@ fn prepare_local_row_stage(
     embedding: &CkksCanonicalEmbedding,
     chain: &ModulusChain,
 ) -> PreparedLocalRowStage {
-    let diagonals = PackedFft2DifStageDiagonals::new(
-        tile_shape,
-        PackedFft2Axis::Rows,
-        span,
-        FftDirection::Forward,
-    );
+    let diagonals = prepare_row_stage_diagonals(tile_shape, span);
     let rotation = diagonals.rotation();
     let degree = embedding.degree();
     let left_exponent = rotation_exponent_left(degree, rotation);
     let right_exponent = rotation_exponent_right(degree, rotation);
-    let stage_plan = RnsNttPlan::new(chain.level(input.level()).moduli().to_vec(), degree);
+    let (stage_plan, prepared_plan) = prepare_row_stage_ntt(input.level(), degree, chain);
     let state = input.state().clone();
     let prepared_left = PreparedRnsGaloisKey::new(
         evaluator.keys().galois_for(&state, left_exponent),
@@ -1456,7 +1487,6 @@ fn prepare_local_row_stage(
         evaluator.keys().galois_for(&state, right_exponent),
         &stage_plan,
     );
-    let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
     let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
         input,
         &diagonals,
@@ -3545,68 +3575,129 @@ pub fn execute_repeated_packed_fft2_dif_stage_cp_hybrid_context(
 /// through the level-aware context; no key generation occurs here.
 ///
 /// A 64-column tile executes six stages and consumes six CKKS levels.
-pub fn execute_packed_local_rows_cp_hybrid_staged(
-    mut values: Vec<RnsCkksCiphertext>,
+pub fn execute_packed_local_rows_cp_hybrid_staged<'a>(
+    values: Vec<RnsCkksCiphertext>,
     tile_layout: (Fft2Shape, usize),
-    evaluator: &RnsCkksEvaluator<'_>,
+    evaluator: &RnsCkksEvaluator<'a>,
     rotations: &PreparedHybridRotationContext<'_>,
-    embedding: &CkksCanonicalEmbedding,
-    chain: &ModulusChain,
+    embedding: &'a CkksCanonicalEmbedding,
+    chain: &'a ModulusChain,
     parallelism: usize,
 ) -> Vec<RnsCkksCiphertext> {
+    let mut context = PackedRowPreparationContext::new();
+
+    execute_packed_local_rows_cp_hybrid_staged_cached(
+        values,
+        tile_layout,
+        evaluator,
+        rotations,
+        embedding,
+        chain,
+        (parallelism, &mut context),
+    )
+}
+
+/// Reuses prepared public local-row operands across compatible executions.
+///
+/// Gaussian hybrid evaluation keys remain externally owned and are resolved
+/// from the supplied rotation context at each level.
+pub fn execute_packed_local_rows_cp_hybrid_staged_cached<'a>(
+    mut values: Vec<RnsCkksCiphertext>,
+    tile_layout: (Fft2Shape, usize),
+    evaluator: &RnsCkksEvaluator<'a>,
+    rotations: &PreparedHybridRotationContext<'_>,
+    embedding: &'a CkksCanonicalEmbedding,
+    chain: &'a ModulusChain,
+    execution: (usize, &mut PackedRowPreparationContext<'a>),
+) -> Vec<RnsCkksCiphertext> {
+    let (parallelism, context) = execution;
     let (tile_shape, tiles_per_ciphertext) = tile_layout;
 
-    assert!(!values.is_empty(), "hybrid local-row inputs are empty");
-    assert!(
-        parallelism > 0,
-        "hybrid local-row parallelism must be positive"
-    );
+    assert!(!values.is_empty(), "hybrid cached row inputs are empty");
+    assert!(parallelism > 0);
     assert!(tiles_per_ciphertext > 0);
+    assert!(tile_shape.cols().is_power_of_two());
+    assert!(tile_shape.cols() >= 2);
+
+    context.bind(evaluator, embedding, chain);
 
     let start_level = values[0].level();
     let degree = embedding.degree();
     let mut span = tile_shape.cols();
-    let mut consumed_levels = 0usize;
+    let mut slot = 0usize;
 
     while span >= 2 {
-        let level = values[0].level();
-        let q_plan = RnsNttPlan::new(chain.level(level).moduli().to_vec(), degree);
-        let prepared_q = PreparedRnsNttPlan::new(&q_plan);
-
-        let diagonals = PackedFft2DifStageDiagonals::new(
-            tile_shape,
-            PackedFft2Axis::Rows,
-            span,
-            FftDirection::Forward,
+        assert!(
+            slot < context.hybrid_stages.len(),
+            "hybrid cache has insufficient stage slots"
         );
 
-        let prepared_stage = PreparedRepeatedPackedFft2DifStage::new(
-            &values[0],
-            &diagonals,
-            tiles_per_ciphertext,
-            embedding,
-            chain,
-            &q_plan,
+        let entry = &mut context.hybrid_stages[slot];
+
+        if entry.is_none() {
+            let (stage_plan, prepared_plan) =
+                prepare_row_stage_ntt(values[0].level(), degree, chain);
+
+            let diagonals = prepare_row_stage_diagonals(tile_shape, span);
+
+            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
+                &values[0],
+                &diagonals,
+                tiles_per_ciphertext,
+                embedding,
+                chain,
+                &stage_plan,
+            );
+
+            *entry = Some(HybridPreparedLocalRowStage {
+                state: values[0].state().clone(),
+                span,
+                tile_shape,
+                tiles_per_ciphertext,
+                stage_plan,
+                prepared_plan,
+                prepared_fft_stage,
+            });
+
+            context.hybrid_preparations += 1;
+        } else {
+            context.hybrid_hits += 1;
+        }
+
+        let prepared = entry.as_ref().expect("hybrid stage missing");
+
+        assert_eq!(
+            &prepared.state,
+            values[0].state(),
+            "hybrid cached CKKS state mismatch"
+        );
+        assert_eq!(prepared.span, span);
+        assert_eq!(prepared.tile_shape.rows(), tile_shape.rows());
+        assert_eq!(prepared.tile_shape.cols(), tile_shape.cols());
+        assert_eq!(prepared.tiles_per_ciphertext, tiles_per_ciphertext);
+        assert_eq!(
+            prepared.stage_plan.moduli(),
+            chain.level(values[0].level()).moduli()
         );
 
         values = execute_packed_local_row_stage_cp_hybrid_batch(
             &values,
-            &prepared_stage,
+            &prepared.prepared_fft_stage,
             evaluator,
             rotations,
             chain,
-            &prepared_q,
+            &prepared.prepared_plan,
             parallelism,
         );
 
-        consumed_levels += 1;
         span /= 2;
+        slot += 1;
     }
 
     assert_eq!(
         values[0].level(),
-        start_level + consumed_levels,
-        "hybrid local-row level consumption mismatch"
+        start_level + slot,
+        "cached hybrid row level consumption mismatch"
     );
 
     values

@@ -658,6 +658,41 @@ fn gaussian_hybrid_six_stage_row_fft() {
         2,
     );
 
+    let mut cache = PackedRowPreparationContext::new();
+
+    let first = execute_packed_local_rows_cp_hybrid_staged_cached(
+        initial.clone(),
+        (shape, tiles_per_ciphertext),
+        &evaluator,
+        &rotations,
+        &embedding,
+        &chain,
+        (2, &mut cache),
+    );
+
+    assert_eq!(first, staged);
+    assert_eq!(cache.hybrid_preparations, 6);
+    assert_eq!(cache.hybrid_hits, 0);
+
+    let second = execute_packed_local_rows_cp_hybrid_staged_cached(
+        initial.clone(),
+        (shape, tiles_per_ciphertext),
+        &evaluator,
+        &rotations,
+        &embedding,
+        &chain,
+        (2, &mut cache),
+    );
+
+    assert_eq!(second, staged);
+    assert_eq!(cache.hybrid_preparations, 6);
+    assert_eq!(cache.hybrid_hits, 6);
+
+    println!(
+        "M1_4D_HYBRID_CACHE_STATUS=PASS preparations={} hits={}",
+        cache.hybrid_preparations, cache.hybrid_hits,
+    );
+
     let mut manual = initial;
 
     for span in [64_usize, 32, 16, 8, 4, 2] {
