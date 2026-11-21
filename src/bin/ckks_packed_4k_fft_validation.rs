@@ -1,18 +1,14 @@
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
-    research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
-    CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext, RnsCkksEvaluationKeys,
-    RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
+    research_profile_65536_for_levels, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
+    RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
 use ccmm_rs::eblas::fft::{
-    execute_packed_1k_fft_columns_cp, execute_packed_1k_fft_rows_cp, fft2_pp,
-    packed_fft_dif_butterfly_cp_prepared, Fft2Shape, FftDirection,
+    execute_packed_1k_fft_rows_cp_hybrid_cached, fft2_pp, packed_fft_dif_butterfly_cp_prepared,
+    Fft2Shape, FftDirection,
 };
 use ccmm_rs::eblas::PreparedComplexSlotsCp;
-use ccmm_rs::grafting::{
-    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout,
-    RnsKeygenConfig,
-};
+use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::ring::{
     centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, ModulusChain,
     PreparedRnsNttPlan, RnsNttPlan,
@@ -57,10 +53,6 @@ fn env_usize(name: &str, default: usize) -> usize {
         Err(std::env::VarError::NotPresent) => default,
         Err(error) => panic!("failed to read {name}: {error}"),
     }
-}
-
-fn block_sizes(limb_count: usize) -> Vec<usize> {
-    vec![1; limb_count]
 }
 
 fn bit_reverse(index: usize, length: usize) -> usize {
@@ -210,41 +202,6 @@ fn error_metrics_physical_vs_oracle(physical: &[Complex64], oracle: &[Complex64]
     };
 
     (rel_l2, max_abs)
-}
-
-fn key_schedule_4k() -> Vec<(usize, usize)> {
-    let mut schedule = Vec::new();
-
-    // 1K row engine starts at level 2.
-    let mut level = 6usize;
-    let mut rotation = TILE_DIM / 2;
-
-    while rotation > 0 {
-        schedule.push((level, rotation));
-        level += 1;
-        rotation /= 2;
-    }
-
-    assert_eq!(level, 12);
-
-    // 1K column engine starts at level 14.
-    schedule.push((15, 16_384));
-    schedule.push((16, 8_192));
-    schedule.push((17, 4_096));
-
-    level = 18;
-    rotation = (TILE_DIM / 2) * TILE_DIM;
-
-    while rotation >= TILE_DIM {
-        schedule.push((level, rotation));
-        level += 1;
-        rotation /= 2;
-    }
-
-    assert_eq!(level, 24);
-    assert_eq!(schedule.len(), 15);
-
-    schedule
 }
 
 fn fill_black_white_slots(macro_row: usize, macro_col: usize, ct_index: usize) -> Vec<Complex64> {
@@ -695,107 +652,9 @@ fn main() {
      * The four new macro stages are inter-ciphertext butterflies and
      * require no Galois rotations.
      */
-    let schedule = key_schedule_4k();
-    let keygen_start = Instant::now();
-
-    let mut evaluation_keys = RnsCkksEvaluationKeys::new();
-    let mut distinct_key_count = 0usize;
-
-    for &(level, rotation) in &schedule {
-        let level_basis = chain.level(level).clone();
-        let level_layout =
-            RnsGadgetLayout::new(level_basis.clone(), block_sizes(level_basis.len()));
-
-        let level_plan = RnsNttPlan::new(level_basis.moduli().to_vec(), degree);
-
-        let left_exponent = rotation_exponent_left(degree, rotation);
-        let right_exponent = rotation_exponent_right(degree, rotation);
-
-        let mut level_keys = RnsCkksLevelKeys::new(level, level_basis);
-
-        println!(
-            "R20_4K_KEYGEN_BEGIN level={} rotation={} limbs={}",
-            level,
-            rotation,
-            level_layout.full_basis().len()
-        );
-        io::stdout().flush().unwrap();
-
-        if left_exponent == right_exponent {
-            let mut rng = ChaCha20Rng::seed_from_u64(0x5232_304b_4b45_5900 ^ ((level as u64) << 8));
-
-            let key = RnsGaloisKey::generate_with_ntt_rng(
-                RnsKeygenConfig {
-                    degree,
-                    plaintext_modulus: 2,
-                    noise_bound: 0,
-                    layout: level_layout.clone(),
-                    plan: &level_plan,
-                },
-                &secret,
-                left_exponent,
-                &mut rng,
-            );
-
-            level_keys.insert_galois_key(key);
-            distinct_key_count += 1;
-        } else {
-            let (left_key, right_key) = std::thread::scope(|scope| {
-                let left_worker = scope.spawn(|| {
-                    let mut rng =
-                        ChaCha20Rng::seed_from_u64(0x5232_304b_4b45_5900 ^ ((level as u64) << 8));
-
-                    RnsGaloisKey::generate_with_ntt_rng(
-                        RnsKeygenConfig {
-                            degree,
-                            plaintext_modulus: 2,
-                            noise_bound: 0,
-                            layout: level_layout.clone(),
-                            plan: &level_plan,
-                        },
-                        &secret,
-                        left_exponent,
-                        &mut rng,
-                    )
-                });
-
-                let right_worker = scope.spawn(|| {
-                    let mut rng =
-                        ChaCha20Rng::seed_from_u64(0x5232_304b_4b45_5901 ^ ((level as u64) << 8));
-
-                    RnsGaloisKey::generate_with_ntt_rng(
-                        RnsKeygenConfig {
-                            degree,
-                            plaintext_modulus: 2,
-                            noise_bound: 0,
-                            layout: level_layout.clone(),
-                            plan: &level_plan,
-                        },
-                        &secret,
-                        right_exponent,
-                        &mut rng,
-                    )
-                });
-
-                (
-                    left_worker.join().expect("4K left keygen panicked"),
-                    right_worker.join().expect("4K right keygen panicked"),
-                )
-            });
-
-            level_keys.insert_galois_key(left_key);
-            level_keys.insert_galois_key(right_key);
-            distinct_key_count += 2;
-        }
-
-        evaluation_keys.insert_level(level_keys);
-
-        println!("R20_4K_KEYGEN_END level={level}");
-        io::stdout().flush().unwrap();
-    }
-
-    println!("R20_4K_GALOIS_KEY_COUNT={distinct_key_count}");
-    println!("R20_4K_KEYGEN_MS={}", keygen_start.elapsed().as_millis());
+    // Macro-level butterflies use no Galois rotations.
+    // Local FFT rotations use separately provisioned Gaussian hybrid keys.
+    let evaluation_keys = RnsCkksEvaluationKeys::new();
 
     let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
 
@@ -832,18 +691,69 @@ fn main() {
     /*
      * Levels 2..11: one reusable 1K row phase per macrotile.
      */
+
+    // Generate one set of Gaussian hybrid row keys for all 16 macrotiles.
+    // Fixed RNG seeds are validation fixtures, not production key entropy.
+    let row_auxiliary = ccmm_rs::ring::ModulusBasis::new(vec![
+        ccmm_rs::ring::Modulus::new(0x7ffffffbee0001),
+        ccmm_rs::ring::Modulus::new(0x7ffffffbe40001),
+    ]);
+
+    let row_schedule = ccmm_rs::eblas::fft::packed_1k_hybrid_rotation_schedule(
+        2,
+        ccmm_rs::eblas::fft::PackedFft2Axis::Rows,
+    );
+
+    let mut row_key_material = Vec::new();
+
+    for (level, rotation) in row_schedule {
+        let mut left_rng = ChaCha20Rng::seed_from_u64(0x518B_1000 + level as u64 * 2);
+        let mut right_rng = ChaCha20Rng::seed_from_u64(0x518B_1001 + level as u64 * 2);
+
+        let (left, right, plan) = ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
+            &chain,
+            degree,
+            level,
+            rotation,
+            &secret,
+            &row_auxiliary,
+            55,
+            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+            2,
+            &mut left_rng,
+            &mut right_rng,
+        );
+
+        let right = right.expect("4K row rotation requires two keys");
+        row_key_material.push((level, left, right, plan));
+    }
+
+    assert_eq!(row_key_material.len(), 6);
+
+    let mut row_rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &row_key_material {
+        row_rotations.insert(*level, left, plan);
+        row_rotations.insert(*level, right, plan);
+    }
+
+    assert_eq!(row_rotations.key_count(), 12);
+
+    let mut row_preparation = ccmm_rs::eblas::fft::PackedRowPreparationContext::new();
+
     for (macro_index, macrotile) in macrotiles.iter_mut().enumerate().take(MACRO_COUNT) {
         let input = macrotile.take().expect("4K row-phase macrotile missing");
 
         let start = Instant::now();
 
-        let output = execute_packed_1k_fft_rows_cp(
+        let output = execute_packed_1k_fft_rows_cp_hybrid_cached(
             input,
             &evaluator,
+            &row_rotations,
             &embedding,
             &chain,
-            inter_ct_parallelism,
-            local_parallelism,
+            (inter_ct_parallelism, local_parallelism),
+            &mut row_preparation,
         );
 
         println!(
@@ -860,6 +770,10 @@ fn main() {
     /*
      * Levels 12..13: two 4K macro-column stages.
      */
+    drop(row_preparation);
+    drop(row_rotations);
+    drop(row_key_material);
+
     for span_macros in [4usize, 2usize] {
         let start = Instant::now();
 
@@ -888,14 +802,68 @@ fn main() {
     /*
      * Levels 14..23: one reusable 1K column phase per macrotile.
      */
+
+    // Provision Gaussian hybrid column keys once for all macrotiles.
+    // Fixed RNG seeds are validation fixtures, not production entropy.
+    let column_auxiliary = ccmm_rs::ring::ModulusBasis::new(vec![
+        ccmm_rs::ring::Modulus::new(0x7ffffffbee0001),
+        ccmm_rs::ring::Modulus::new(0x7ffffffbe40001),
+    ]);
+
+    let column_schedule = ccmm_rs::eblas::fft::packed_1k_hybrid_rotation_schedule(
+        14,
+        ccmm_rs::eblas::fft::PackedFft2Axis::Columns,
+    );
+
+    let mut column_key_material = Vec::new();
+    let mut column_key_count = 0usize;
+
+    for (level, rotation) in column_schedule {
+        let mut left_rng = ChaCha20Rng::seed_from_u64(0x519D_1000 + level as u64 * 2);
+        let mut right_rng = ChaCha20Rng::seed_from_u64(0x519D_1001 + level as u64 * 2);
+
+        let (left, right, plan) = ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
+            &chain,
+            degree,
+            level,
+            rotation,
+            &secret,
+            &column_auxiliary,
+            55,
+            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+            2,
+            &mut left_rng,
+            &mut right_rng,
+        );
+
+        column_key_count += 1 + usize::from(right.is_some());
+        column_key_material.push((level, left, right, plan));
+    }
+
+    assert_eq!(column_key_material.len(), 9);
+    assert_eq!(column_key_count, 17);
+
+    let mut column_rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &column_key_material {
+        column_rotations.insert(*level, left, plan);
+
+        if let Some(right) = right {
+            column_rotations.insert(*level, right, plan);
+        }
+    }
+
+    assert_eq!(column_rotations.key_count(), 17);
+
     for (macro_index, macrotile) in macrotiles.iter_mut().enumerate().take(MACRO_COUNT) {
         let input = macrotile.take().expect("4K column-phase macrotile missing");
 
         let start = Instant::now();
 
-        let output = execute_packed_1k_fft_columns_cp(
+        let output = ccmm_rs::eblas::fft::execute_packed_1k_fft_columns_cp_hybrid_borrowed(
             input,
             &evaluator,
+            &column_rotations,
             &embedding,
             &chain,
             inter_ct_parallelism,

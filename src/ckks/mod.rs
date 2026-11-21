@@ -13,6 +13,7 @@ mod hybrid_ciphertext;
 mod hybrid_multiply;
 mod key_accounting;
 mod parameters;
+mod prepared_hybrid_rotation_context;
 mod prepared_multiplication_context;
 pub use parameters::{CkksErrorDistribution, CkksSecretDistribution};
 pub mod hybrid_rns_galois_key;
@@ -46,6 +47,7 @@ pub use galois_key::{
 };
 pub use hybrid_ciphertext::HybridCkksCiphertext;
 pub use hybrid_multiply::{multiply_transition_relinearize_hybrid_ckks, HybridCkksMultiplyConfig};
+pub use prepared_hybrid_rotation_context::PreparedHybridRotationContext;
 pub use prepared_multiplication_context::PreparedRnsCkksMultiplicationContext;
 // R16_7C2B1_PROFILE_EXPORT
 pub use hybrid_rns_galois_key::{
@@ -662,3 +664,5 @@ pub use bounded_rns_galois_key::{
 };
 
 pub use rns_galois_key::apply_rns_galois_automorphism_with_prepared_dynamic_ntt_resident_shared_b;
+
+pub use hybrid_rns_galois_key::generate_hybrid_rotation_stage_keys_with_rng;

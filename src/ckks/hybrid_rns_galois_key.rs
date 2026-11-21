@@ -26,6 +26,77 @@ pub struct PreparedHybridRnsGaloisKey {
     entries: Vec<Vec<(NttPolynomial, NttPolynomial)>>,
 }
 
+/// Generates a level-specific pair of Gaussian hybrid rotation keys.
+///
+/// The caller provides independent cryptographic RNG streams. This
+/// function owns the resulting keys and their matching QP NTT plan.
+/// It does not retain the secret or cache evaluation keys.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_hybrid_rotation_stage_keys_with_rng<R>(
+    chain: &crate::ring::ModulusChain,
+    degree: usize,
+    level: usize,
+    rotation: usize,
+    secret: &[i8],
+    auxiliary: &crate::ring::ModulusBasis,
+    base_log: u32,
+    distribution: crate::rlwe::ErrorDistribution,
+    plaintext_modulus: u64,
+    left_rng: &mut R,
+    right_rng: &mut R,
+) -> (
+    PreparedHybridRnsGaloisKey,
+    Option<PreparedHybridRnsGaloisKey>,
+    crate::ring::RnsNttPlan,
+)
+where
+    R: rand::RngCore + rand::CryptoRng,
+{
+    assert_eq!(secret.len(), degree);
+    assert!(rotation > 0 && rotation < degree / 2);
+
+    let q = chain.level(level).clone();
+
+    let mut qp_moduli = q.moduli().to_vec();
+    qp_moduli.extend_from_slice(auxiliary.moduli());
+
+    let qp_plan = crate::ring::RnsNttPlan::new(qp_moduli, degree);
+    let layout = crate::grafting::BoundedGadgetLayout::new(q, base_log);
+
+    let left_exponent = crate::ckks::rotation_exponent_left(degree, rotation);
+    let right_exponent = crate::ckks::rotation_exponent_right(degree, rotation);
+
+    let left = PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+        layout.clone(),
+        auxiliary.clone(),
+        secret,
+        left_exponent,
+        distribution,
+        plaintext_modulus,
+        &qp_plan,
+        left_rng,
+    );
+
+    let right = if right_exponent != left_exponent {
+        Some(
+            PreparedHybridRnsGaloisKey::generate_with_distribution_ntt_rng(
+                layout,
+                auxiliary.clone(),
+                secret,
+                right_exponent,
+                distribution,
+                plaintext_modulus,
+                &qp_plan,
+                right_rng,
+            ),
+        )
+    } else {
+        None
+    };
+
+    (left, right, qp_plan)
+}
+
 fn transformed_ternary_secret(secret: &[i8], exponent: usize) -> Vec<i8> {
     let poly = Polynomial::new(
         crate::ring::Modulus::new(3),
@@ -171,6 +242,11 @@ impl PreparedHybridRnsGaloisKey {
 
     pub fn exponent(&self) -> usize {
         self.exponent
+    }
+
+    /// Polynomial ring degree associated with this prepared key.
+    pub fn degree(&self) -> usize {
+        self.degree
     }
 
     // R36_8G_2C_1_KEY_PAYLOAD_ACCOUNTING

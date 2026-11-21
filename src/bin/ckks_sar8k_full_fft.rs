@@ -18,19 +18,12 @@
 
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
-    research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
-    CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext, RnsCkksEvaluationKeys,
-    RnsCkksEvaluator, RnsCkksLevelKeys, RnsGaloisKey,
+    research_profile_65536_for_levels, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
+    RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
-use ccmm_rs::eblas::fft::{
-    execute_packed_1k_fft_columns_cp, execute_packed_1k_fft_rows_cp_cached,
-    packed_fft_dif_butterfly_cp_prepared, PackedRowPreparationContext,
-};
+use ccmm_rs::eblas::fft::{packed_fft_dif_butterfly_cp_prepared, PackedRowPreparationContext};
 use ccmm_rs::eblas::PreparedComplexSlotsCp;
-use ccmm_rs::grafting::{
-    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, RnsGadgetLayout,
-    RnsKeygenConfig,
-};
+use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::ring::{
     centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, ModulusChain,
     PreparedRnsNttPlan, RnsNttPlan,
@@ -600,89 +593,60 @@ fn validate_checkpoint(
     assert!(pass, "encrypted row-strip checkpoint {stage} failed");
 }
 
-fn block_sizes(limb_count: usize) -> Vec<usize> {
-    vec![1; limb_count]
-}
+fn generate_row_hybrid_keys(
+    chain: &ModulusChain,
+    degree: usize,
+    secret: &[i8],
+) -> Vec<(
+    usize,
+    ccmm_rs::ckks::PreparedHybridRnsGaloisKey,
+    ccmm_rs::ckks::PreparedHybridRnsGaloisKey,
+    RnsNttPlan,
+)> {
+    let auxiliary = ccmm_rs::ring::ModulusBasis::new(vec![
+        ccmm_rs::ring::Modulus::new(0x7ffffffbee0001),
+        ccmm_rs::ring::Modulus::new(0x7ffffffbe40001),
+    ]);
 
-fn generate_row_keys(chain: &ModulusChain, degree: usize, secret: &[i8]) -> RnsCkksEvaluationKeys {
-    let mut keys = RnsCkksEvaluationKeys::new();
-    let mut rotation = TILE_DIM / 2;
-    let mut count = 0usize;
-    for level in 7..=12 {
-        let basis = chain.level(level).clone();
-        let layout = RnsGadgetLayout::new(basis.clone(), block_sizes(basis.len()));
-        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
-        let left_exponent = rotation_exponent_left(degree, rotation);
-        let right_exponent = rotation_exponent_right(degree, rotation);
-        let mut level_keys = RnsCkksLevelKeys::new(level, basis);
+    let schedule = ccmm_rs::eblas::fft::packed_1k_hybrid_rotation_schedule(
+        3,
+        ccmm_rs::eblas::fft::PackedFft2Axis::Rows,
+    );
+
+    assert_eq!(schedule.len(), 6);
+    let mut material = Vec::with_capacity(6);
+
+    for (level, rotation) in schedule {
         println!("DATE27_STRIP_KEYGEN_BEGIN level={level} rotation={rotation}");
         io::stdout().flush().unwrap();
-        if left_exponent == right_exponent {
-            let mut rng = ChaCha20Rng::seed_from_u64(0x5232_304b_4b45_5900 ^ ((level as u64) << 8));
-            let key = RnsGaloisKey::generate_with_ntt_rng(
-                RnsKeygenConfig {
-                    degree,
-                    plaintext_modulus: 2,
-                    noise_bound: 0,
-                    layout: layout.clone(),
-                    plan: &plan,
-                },
-                secret,
-                left_exponent,
-                &mut rng,
-            );
-            level_keys.insert_galois_key(key);
-            count += 1;
-        } else {
-            let (left, right) = std::thread::scope(|scope| {
-                let left_worker = scope.spawn(|| {
-                    let mut rng =
-                        ChaCha20Rng::seed_from_u64(0x5232_304b_4b45_5900 ^ ((level as u64) << 8));
-                    RnsGaloisKey::generate_with_ntt_rng(
-                        RnsKeygenConfig {
-                            degree,
-                            plaintext_modulus: 2,
-                            noise_bound: 0,
-                            layout: layout.clone(),
-                            plan: &plan,
-                        },
-                        secret,
-                        left_exponent,
-                        &mut rng,
-                    )
-                });
-                let right_worker = scope.spawn(|| {
-                    let mut rng =
-                        ChaCha20Rng::seed_from_u64(0x5232_304b_4b45_5901 ^ ((level as u64) << 8));
-                    RnsGaloisKey::generate_with_ntt_rng(
-                        RnsKeygenConfig {
-                            degree,
-                            plaintext_modulus: 2,
-                            noise_bound: 0,
-                            layout: layout.clone(),
-                            plan: &plan,
-                        },
-                        secret,
-                        right_exponent,
-                        &mut rng,
-                    )
-                });
-                (
-                    left_worker.join().expect("row keygen left failed"),
-                    right_worker.join().expect("row keygen right failed"),
-                )
-            });
-            level_keys.insert_galois_key(left);
-            level_keys.insert_galois_key(right);
-            count += 2;
-        }
-        keys.insert_level(level_keys);
+
+        let mut left_rng = ChaCha20Rng::seed_from_u64(0x518B_1000 + level as u64 * 2);
+        let mut right_rng = ChaCha20Rng::seed_from_u64(0x518B_1001 + level as u64 * 2);
+
+        let (left, right, plan) = ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
+            chain,
+            degree,
+            level,
+            rotation,
+            secret,
+            &auxiliary,
+            55,
+            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+            2,
+            &mut left_rng,
+            &mut right_rng,
+        );
+
+        let right = right.expect("SAR row stage requires two rotation keys");
+        material.push((level, left, right, plan));
+
         println!("DATE27_STRIP_KEYGEN_END level={level}");
-        rotation /= 2;
+        io::stdout().flush().unwrap();
     }
-    assert_eq!(rotation, 0);
-    println!("DATE27_STRIP_GALOIS_KEY_COUNT={count}");
-    keys
+
+    assert_eq!(material.len(), 6);
+    println!("DATE27_STRIP_GALOIS_KEY_COUNT=12");
+    material
 }
 
 fn usage() -> ! {
@@ -806,11 +770,25 @@ fn original_row_strip_main() {
         encrypt_start.elapsed().as_millis()
     );
     let keys_start = Instant::now();
-    let keys = if stop_stage == 13 {
-        generate_row_keys(&chain, embedding.degree(), &secret)
+    let row_key_material = if stop_stage == 13 {
+        generate_row_hybrid_keys(&chain, embedding.degree(), &secret)
     } else {
-        RnsCkksEvaluationKeys::new()
+        Vec::new()
     };
+
+    let mut row_rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &row_key_material {
+        row_rotations.insert(*level, left, plan);
+        row_rotations.insert(*level, right, plan);
+    }
+
+    assert_eq!(
+        row_rotations.key_count(),
+        if row_key_material.is_empty() { 0 } else { 12 }
+    );
+
+    let keys = RnsCkksEvaluationKeys::new();
     println!(
         "DATE27_STRIP_KEYGEN_MS={}",
         keys_start.elapsed().as_millis()
@@ -857,13 +835,13 @@ fn original_row_strip_main() {
         for macro_col in 0..MACROS_PER_AXIS {
             let start = Instant::now();
             let input = macrotiles[macro_col].take().expect("row macrotile missing");
-            let output = execute_packed_1k_fft_rows_cp_cached(
+            let output = ccmm_rs::eblas::fft::execute_packed_1k_fft_rows_cp_hybrid_cached(
                 input,
                 &evaluator,
+                &row_rotations,
                 &embedding,
                 &chain,
-                inter_ct,
-                local_parallelism,
+                (inter_ct, local_parallelism),
                 &mut cached,
             );
             assert_eq!(output.len(), CT_PER_MACRO);
@@ -994,6 +972,7 @@ fn encrypted_strip_to_row13<'a>(
     scale: f64,
     evaluator: &RnsCkksEvaluator<'a>,
     row_cache: &mut PackedRowPreparationContext<'a>,
+    row_rotations: &ccmm_rs::ckks::PreparedHybridRotationContext<'_>,
     inter_ct: usize,
     local: usize,
     check_cts_per_macro: usize,
@@ -1031,8 +1010,14 @@ fn encrypted_strip_to_row13<'a>(
         let input = macrotiles[macro_col]
             .take()
             .expect("row13 missing macrotile");
-        let output = execute_packed_1k_fft_rows_cp_cached(
-            input, evaluator, embedding, chain, inter_ct, local, row_cache,
+        let output = ccmm_rs::eblas::fft::execute_packed_1k_fft_rows_cp_hybrid_cached(
+            input,
+            evaluator,
+            row_rotations,
+            embedding,
+            chain,
+            (inter_ct, local),
+            row_cache,
         );
         assert_eq!(output.len(), CT_PER_MACRO);
         assert_eq!(output[0].level(), 13);
@@ -1258,7 +1243,21 @@ fn stage14_pair_main(args: &[String]) {
         secret[0] = 1;
     }
     // One secret key, one evaluation-key inventory for both strips.
-    let keys = generate_row_keys(&chain, embedding.degree(), &secret);
+    let row_key_material = generate_row_hybrid_keys(&chain, embedding.degree(), &secret);
+
+    let mut row_rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &row_key_material {
+        row_rotations.insert(*level, left, plan);
+        row_rotations.insert(*level, right, plan);
+    }
+
+    assert_eq!(
+        row_rotations.key_count(),
+        if row_key_material.is_empty() { 0 } else { 12 }
+    );
+
+    let keys = RnsCkksEvaluationKeys::new();
     let evaluator = RnsCkksEvaluator::new(&chain, &keys);
     log_memory("keys");
     let mut cached_rows = PackedRowPreparationContext::new();
@@ -1272,6 +1271,7 @@ fn stage14_pair_main(args: &[String]) {
         scale,
         &evaluator,
         &mut cached_rows,
+        &row_rotations,
         inter_ct,
         local,
         check_cts_per_macro,
@@ -1303,6 +1303,7 @@ fn stage14_pair_main(args: &[String]) {
         scale,
         &evaluator,
         &mut cached_rows,
+        &row_rotations,
         inter_ct,
         local,
         check_cts_per_macro,
@@ -1768,7 +1769,21 @@ fn four_strip_stage15_main(args: &[String]) {
         secret[0] = 1;
     }
     // All four strips share one secret and level-indexed evaluation keys.
-    let keys = generate_row_keys(&chain, embedding.degree(), &secret);
+    let row_key_material = generate_row_hybrid_keys(&chain, embedding.degree(), &secret);
+
+    let mut row_rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &row_key_material {
+        row_rotations.insert(*level, left, plan);
+        row_rotations.insert(*level, right, plan);
+    }
+
+    assert_eq!(
+        row_rotations.key_count(),
+        if row_key_material.is_empty() { 0 } else { 12 }
+    );
+
+    let keys = RnsCkksEvaluationKeys::new();
     let evaluator = RnsCkksEvaluator::new(&chain, &keys);
     log_memory("four_keys");
     let mut cached = PackedRowPreparationContext::new();
@@ -1783,6 +1798,7 @@ fn four_strip_stage15_main(args: &[String]) {
         scale,
         &evaluator,
         &mut cached,
+        &row_rotations,
         inter_ct,
         local,
         check_cts_per_macro,
@@ -1798,6 +1814,7 @@ fn four_strip_stage15_main(args: &[String]) {
         scale,
         &evaluator,
         &mut cached,
+        &row_rotations,
         inter_ct,
         local,
         check_cts_per_macro,
@@ -1823,6 +1840,7 @@ fn four_strip_stage15_main(args: &[String]) {
         scale,
         &evaluator,
         &mut cached,
+        &row_rotations,
         inter_ct,
         local,
         check_cts_per_macro,
@@ -1838,6 +1856,7 @@ fn four_strip_stage15_main(args: &[String]) {
         scale,
         &evaluator,
         &mut cached,
+        &row_rotations,
         inter_ct,
         local,
         check_cts_per_macro,
@@ -2337,7 +2356,21 @@ fn eight_stage16_main(args: &[String]) {
         secret[0] = 1;
     }
     let keygen_started = Instant::now();
-    let keys = generate_row_keys(&chain, embedding.degree(), &secret);
+    let row_key_material = generate_row_hybrid_keys(&chain, embedding.degree(), &secret);
+
+    let mut row_rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &row_key_material {
+        row_rotations.insert(*level, left, plan);
+        row_rotations.insert(*level, right, plan);
+    }
+
+    assert_eq!(
+        row_rotations.key_count(),
+        if row_key_material.is_empty() { 0 } else { 12 }
+    );
+
+    let keys = RnsCkksEvaluationKeys::new();
     let evaluator = RnsCkksEvaluator::new(&chain, &keys);
     println!(
         "DATE27_EIGHT_KEYGEN_MS={}",
@@ -2361,6 +2394,7 @@ fn eight_stage16_main(args: &[String]) {
                 scale,
                 &evaluator,
                 &mut cached,
+                &row_rotations,
                 inter_ct,
                 local,
                 check_cts_per_macro,
@@ -2463,66 +2497,10 @@ fn eight_stage16_main(args: &[String]) {
 // checks and memory guards only. The source stage16 executor remains present
 // in this isolated binary as an independent baseline.
 fn full_column_key_schedule() -> Vec<(usize, usize)> {
-    let mut schedule = vec![(17, 16384), (18, 8192), (19, 4096)];
-    let mut rotation = 2048;
-    for level in 20..=25 {
-        schedule.push((level, rotation));
-        rotation /= 2;
-    }
-    assert_eq!(schedule.len(), 9);
-    assert_eq!(rotation, 32);
-    schedule
-}
-
-fn full_generate_column_keys(
-    chain: &ModulusChain,
-    degree: usize,
-    secret: &[i8],
-) -> RnsCkksEvaluationKeys {
-    let mut keys = RnsCkksEvaluationKeys::new();
-    let mut count = 0usize;
-    for (level, rotation) in full_column_key_schedule() {
-        eight_memory_gate("before_column_keygen_level", 24);
-        let started = Instant::now();
-        let basis = chain.level(level).clone();
-        let layout = RnsGadgetLayout::new(basis.clone(), block_sizes(basis.len()));
-        let plan = RnsNttPlan::new(basis.moduli().to_vec(), degree);
-        let left = rotation_exponent_left(degree, rotation);
-        let right = rotation_exponent_right(degree, rotation);
-        let mut level_keys = RnsCkksLevelKeys::new(level, basis);
-        println!("DATE27_FULL_COLUMN_KEY_BEGIN level={level} rotation={rotation}");
-        io::stdout().flush().unwrap();
-        for (direction, exponent) in [(0u64, left), (1u64, right)] {
-            if direction == 1 && left == right {
-                continue;
-            }
-            let seed = 0x5232_304b_4b45_5900u64 ^ ((level as u64) << 8) ^ direction;
-            let mut rng = ChaCha20Rng::seed_from_u64(seed);
-            let key = RnsGaloisKey::generate_with_ntt_rng(
-                RnsKeygenConfig {
-                    degree,
-                    plaintext_modulus: 2,
-                    noise_bound: 0,
-                    layout: layout.clone(),
-                    plan: &plan,
-                },
-                secret,
-                exponent,
-                &mut rng,
-            );
-            level_keys.insert_galois_key(key);
-            count += 1;
-        }
-        keys.insert_level(level_keys);
-        println!(
-            "DATE27_FULL_COLUMN_KEY_DONE level={level} elapsed_ms={}",
-            started.elapsed().as_millis()
-        );
-        io::stdout().flush().unwrap();
-        eight_memory_gate("after_column_keygen_level", 24);
-    }
-    println!("DATE27_FULL_COLUMN_GALOIS_KEYS={count}");
-    keys
+    ccmm_rs::eblas::fft::packed_1k_hybrid_rotation_schedule(
+        16,
+        ccmm_rs::eblas::fft::PackedFft2Axis::Columns,
+    )
 }
 
 // Apply ten successive 1024-point DIF butterflies to the corresponding
@@ -2852,7 +2830,21 @@ fn full_stage26_main(args: &[String]) {
     // Use one secret across all stages; release row keys before creating
     // independent level-17..25 column keys to limit resident memory.
     let keygen_started = Instant::now();
-    let row_keys = generate_row_keys(&chain, embedding.degree(), &secret);
+    let row_key_material = generate_row_hybrid_keys(&chain, embedding.degree(), &secret);
+
+    let mut row_rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &row_key_material {
+        row_rotations.insert(*level, left, plan);
+        row_rotations.insert(*level, right, plan);
+    }
+
+    assert_eq!(
+        row_rotations.key_count(),
+        if row_key_material.is_empty() { 0 } else { 12 }
+    );
+
+    let row_keys = RnsCkksEvaluationKeys::new();
     let row_evaluator = RnsCkksEvaluator::new(&chain, &row_keys);
     println!(
         "DATE27_FULL_ROW_KEYGEN_MS={}",
@@ -2874,6 +2866,7 @@ fn full_stage26_main(args: &[String]) {
                 scale,
                 &row_evaluator,
                 &mut cached,
+                &row_rotations,
                 inter_ct,
                 local,
                 check_cts_per_macro,
@@ -2956,11 +2949,74 @@ fn full_stage26_main(args: &[String]) {
     io::stdout().flush().unwrap();
     eight_memory_gate("full_after_stage16", 24);
     drop(row_evaluator);
+    drop(row_rotations);
+    drop(row_key_material);
     drop(row_keys);
     eight_memory_gate("full_row_keys_released", 24);
     let started = Instant::now();
-    let column_keys = full_generate_column_keys(&chain, embedding.degree(), &secret);
-    let column_evaluator = RnsCkksEvaluator::new(&chain, &column_keys);
+    // Gaussian hybrid column keys are shared across all 64 macrotiles.
+    // Fixed RNG seeds are validation fixtures, not production entropy.
+    let column_auxiliary = ccmm_rs::ring::ModulusBasis::new(vec![
+        ccmm_rs::ring::Modulus::new(0x7ffffffbee0001),
+        ccmm_rs::ring::Modulus::new(0x7ffffffbe40001),
+    ]);
+
+    let mut column_key_material = Vec::new();
+    let mut column_key_count = 0usize;
+
+    for (level, rotation) in full_column_key_schedule() {
+        eight_memory_gate("before_column_keygen_level", 24);
+        let stage_started = Instant::now();
+
+        println!("DATE27_FULL_COLUMN_KEY_BEGIN level={level} rotation={rotation}");
+        io::stdout().flush().unwrap();
+
+        let mut left_rng = ChaCha20Rng::seed_from_u64(0x519D_1000 + level as u64 * 2);
+        let mut right_rng = ChaCha20Rng::seed_from_u64(0x519D_1001 + level as u64 * 2);
+
+        let (left, right, plan) = ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
+            &chain,
+            embedding.degree(),
+            level,
+            rotation,
+            &secret,
+            &column_auxiliary,
+            55,
+            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
+            2,
+            &mut left_rng,
+            &mut right_rng,
+        );
+
+        column_key_count += 1 + usize::from(right.is_some());
+        column_key_material.push((level, left, right, plan));
+
+        println!(
+            "DATE27_FULL_COLUMN_KEY_DONE level={level} elapsed_ms={}",
+            stage_started.elapsed().as_millis()
+        );
+        io::stdout().flush().unwrap();
+        eight_memory_gate("after_column_keygen_level", 24);
+    }
+
+    assert_eq!(column_key_material.len(), 9);
+    assert_eq!(column_key_count, 17);
+
+    let mut column_rotations = ccmm_rs::ckks::PreparedHybridRotationContext::new(&chain);
+
+    for (level, left, right, plan) in &column_key_material {
+        column_rotations.insert(*level, left, plan);
+        if let Some(right) = right {
+            column_rotations.insert(*level, right, plan);
+        }
+    }
+
+    assert_eq!(column_rotations.key_count(), 17);
+    println!("DATE27_FULL_COLUMN_GALOIS_KEYS={column_key_count}");
+
+    // Macro butterflies use no conventional rotation keys.
+    let column_evaluation_keys = RnsCkksEvaluationKeys::new();
+    let column_evaluator = RnsCkksEvaluator::new(&chain, &column_evaluation_keys);
     println!(
         "DATE27_FULL_COLUMN_KEYGEN_MS={}",
         started.elapsed().as_millis()
@@ -2984,9 +3040,10 @@ fn full_stage26_main(args: &[String]) {
                 .iter()
                 .all(|ct| ct.level() == 16 && ct.basis().len() == 12));
             let started = Instant::now();
-            let output = execute_packed_1k_fft_columns_cp(
+            let output = ccmm_rs::eblas::fft::execute_packed_1k_fft_columns_cp_hybrid_borrowed(
                 input,
                 &column_evaluator,
+                &column_rotations,
                 &embedding,
                 &chain,
                 inter_ct,
