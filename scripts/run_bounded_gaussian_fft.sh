@@ -40,7 +40,7 @@ OUT="results/fft_milestones/$MILESTONE"
 
 mkdir -p "$OUT"
 
-export FFT_GALOIS_KEY_MODE=bounded_gaussian_direct
+export FFT_GALOIS_KEY_MODE=hybrid_gaussian
 export FFT_RANDOMNESS_MODE="$RANDOMNESS_MODE"
 export FHE_KEYGEN_PROFILE=0
 

@@ -3,20 +3,14 @@ mod fft2_r1_npy;
 use ccmm_rs::application_support::ckks::encode_rns;
 use ccmm_rs::ckks::{
     research_profile_16384, research_profile_32768, research_profile_65536,
-    research_profile_65536_for_levels, rotation_exponent_left, rotation_exponent_right,
-    BoundedRnsGaloisKey, CkksCanonicalEmbedding, CkksChainState, PreparedBoundedRnsGaloisKey,
-    PreparedRnsGaloisKey, RnsCkksCiphertext, RnsCkksEvaluationKeys, RnsCkksEvaluator,
-    RnsCkksLevelKeys, RnsGaloisKey,
+    research_profile_65536_for_levels, CkksCanonicalEmbedding, CkksChainState, RnsCkksCiphertext,
+    RnsCkksEvaluationKeys, RnsCkksEvaluator,
 };
 use ccmm_rs::eblas::fft::{
-    execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared, fft2_pp,
-    packed_fft_dif_butterfly_cp, Fft2Shape, FftDirection, PackedFft2Axis,
+    fft2_pp, packed_fft_dif_butterfly_cp, Fft2Shape, FftDirection, PackedFft2Axis,
     PackedFft2DifStageDiagonals, PreparedRepeatedPackedFft2DifStage,
 };
-use ccmm_rs::grafting::{
-    decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng, BoundedGadgetLayout,
-    BoundedRnsKeygenConfig, RnsGadgetLayout, RnsKeygenConfig,
-};
+use ccmm_rs::grafting::{decrypt_rns_raw_with_ntt, encrypt_rns_raw_with_distribution_ntt_rng};
 use ccmm_rs::ring::{
     centered_representative_big, composite_modulus_big, reconstruct_coefficients_big, ModulusChain,
     PreparedRnsNttPlan, RnsNttPlan,
@@ -35,38 +29,14 @@ use std::time::Instant;
 
 const SIGMA: f64 = 3.19;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FftGaloisKeyMode {
-    Baseline,
-    Gaussian,
-    BoundedGaussian,
-    BoundedGaussianDirect,
-}
+fn validate_fft_galois_key_mode() {
+    let mode =
+        std::env::var("FFT_GALOIS_KEY_MODE").unwrap_or_else(|_| "hybrid_gaussian".to_string());
 
-impl FftGaloisKeyMode {
-    fn from_environment() -> Self {
-        match std::env::var("FFT_GALOIS_KEY_MODE")
-            .unwrap_or_else(|_| "bounded_gaussian_direct".to_string())
-            .as_str()
-        {
-            "baseline" => Self::Baseline,
-            "gaussian" => Self::Gaussian,
-            "bounded_gaussian" => Self::BoundedGaussian,
-            "bounded_gaussian_direct" => Self::BoundedGaussianDirect,
-            other => {
-                panic!("unsupported FFT_GALOIS_KEY_MODE={other}; expected baseline, gaussian, bounded_gaussian, or bounded_gaussian_direct")
-            }
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Baseline => "baseline",
-            Self::Gaussian => "gaussian",
-            Self::BoundedGaussian => "bounded_gaussian",
-            Self::BoundedGaussianDirect => "bounded_gaussian_direct",
-        }
-    }
+    assert!(
+        mode == "hybrid_gaussian",
+        "unsupported FFT_GALOIS_KEY_MODE={mode}; expected hybrid_gaussian"
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +139,8 @@ fn execute_gaussian_hybrid_local_stage(
     let mut left_rng = randomness_mode.rng(0x4859_4252_4944_0000 ^ seed);
     let mut right_rng = randomness_mode.rng(0x4859_4252_4944_0001 ^ seed);
 
+    let hybrid_keygen_start = Instant::now();
+
     let (left, right, qp_plan) = ccmm_rs::ckks::generate_hybrid_rotation_stage_keys_with_rng(
         chain,
         degree,
@@ -183,28 +155,51 @@ fn execute_gaussian_hybrid_local_stage(
         &mut right_rng,
     );
 
+    let hybrid_keygen_ms = hybrid_keygen_start.elapsed().as_millis();
+
     let right = right.expect("hybrid local FFT requires distinct rotation keys");
 
+    let hybrid_evaluation_start = Instant::now();
     let prepared_plan = PreparedRnsNttPlan::new(stage_plan);
 
-    let outputs: Vec<RnsCkksCiphertext> = values
-        .iter()
-        .map(|input| {
-            let prepared = PreparedRepeatedPackedFft2DifStage::new(
-                input, diagonals, 1, embedding, chain, stage_plan,
-            );
+    use rayon::prelude::*;
 
-            execute_repeated_packed_fft2_dif_stage_cp_hybrid_prepared(
-                input,
-                &prepared,
-                evaluator,
-                (&left, &right),
-                chain,
-                &qp_plan,
-                &prepared_plan,
-            )
-        })
-        .collect();
+    let workers = fft_local_tile_workers().min(values.len());
+
+    let evaluate_tile = |input: &RnsCkksCiphertext| {
+        let prepared = PreparedRepeatedPackedFft2DifStage::new(
+            input, diagonals, 1, embedding, chain, stage_plan,
+        );
+        execute_repeated_packed_fft2_dif_stage_cp_hybrid_prepared(
+            input,
+            &prepared,
+            evaluator,
+            (&left, &right),
+            chain,
+            &qp_plan,
+            &prepared_plan,
+        )
+    };
+
+    let outputs: Vec<RnsCkksCiphertext> = if workers == 1 {
+        values.iter().map(evaluate_tile).collect()
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .expect("hybrid FFT tile worker pool creation failed");
+
+        pool.install(|| values.par_iter().map(evaluate_tile).collect())
+    };
+
+    println!(
+        "TILED_FFT_HYBRID_TILE_WORKERS level={} workers={} ciphertexts={}",
+        level,
+        workers,
+        values.len()
+    );
+
+    let hybrid_evaluation_ms = hybrid_evaluation_start.elapsed().as_millis();
 
     assert!(
         outputs.iter().all(|v| v.level() == level + 1),
@@ -212,311 +207,19 @@ fn execute_gaussian_hybrid_local_stage(
     );
 
     println!(
+        "TILED_FFT_HYBRID_KEYGEN_MS level={} rotation={} elapsed_ms={}",
+        level, rotation, hybrid_keygen_ms
+    );
+    println!(
+        "TILED_FFT_HYBRID_EVALUATION_MS level={} rotation={} elapsed_ms={}",
+        level, rotation, hybrid_evaluation_ms
+    );
+
+    println!(
         "TILED_FFT_HYBRID_STAGE_STATUS=PASS level={} rotation={} ciphertexts={}",
         level,
         rotation,
         outputs.len()
-    );
-
-    outputs
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_bounded_gaussian_local_stage(
-    randomness_mode: FftRandomnessMode,
-    direct_prepared: bool,
-    values: &[RnsCkksCiphertext],
-    diagonals: &PackedFft2DifStageDiagonals,
-    evaluator: &RnsCkksEvaluator<'_>,
-    secret: &[i8],
-    embedding: &CkksCanonicalEmbedding,
-    chain: &ModulusChain,
-    stage_plan: &RnsNttPlan,
-) -> Vec<RnsCkksCiphertext> {
-    const BASE_LOG: u32 = 8;
-
-    assert!(
-        !values.is_empty(),
-        "bounded Gaussian FFT stage requires at least one ciphertext"
-    );
-
-    let stage_level = values[0].level();
-
-    assert!(
-        values.iter().all(|value| value.level() == stage_level),
-        "bounded Gaussian FFT stage requires uniform ciphertext levels"
-    );
-
-    let degree = stage_plan.degree();
-    let basis = chain.level(stage_level).clone();
-    let rotation = diagonals.rotation();
-
-    let layout = BoundedGadgetLayout::new(basis, BASE_LOG);
-    let digits = layout.digit_count();
-
-    println!(
-        "R15_G11_STAGE_BEGIN level={stage_level} rotation={rotation} limbs={} digits={digits}",
-        stage_plan.moduli().len()
-    );
-
-    let prepared_plan = PreparedRnsNttPlan::new(stage_plan);
-
-    let key_pipeline_start = Instant::now();
-    let profile_enabled =
-        direct_prepared && std::env::var("FHE_KEYGEN_PROFILE").as_deref() == Ok("1");
-
-    let (
-        (prepared_left, left_keygen_ms, left_preparation_ms),
-        (prepared_right, right_keygen_ms, right_preparation_ms),
-    ) = std::thread::scope(|scope| {
-        let left_layout = layout.clone();
-        let right_layout = layout;
-
-        let left_worker = scope.spawn(move || {
-            let mut rng = randomness_mode.rng(0x1531_1100 ^ ((stage_level as u64) << 8));
-
-            let keygen_start = Instant::now();
-
-            if direct_prepared {
-                let prepared = if profile_enabled {
-                    let mut profile = ccmm_rs::grafting::PreparedRlweEncryptionProfile::default();
-
-                    let prepared =
-                        PreparedBoundedRnsGaloisKey::generate_profiled_with_distribution_ntt_rng(
-                            BoundedRnsKeygenConfig {
-                                plaintext_modulus: 2,
-                                layout: left_layout,
-                                plan: stage_plan,
-                            },
-                            secret,
-                            rotation_exponent_left(degree, rotation),
-                            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                            &mut rng,
-                            &mut profile,
-                        );
-
-                    println!("R15_G14_KEY_PROFILE_DIRECTION=left");
-                    println!("R15_G14_KEY_PROFILE_LEVEL={stage_level}");
-                    println!(
-                        "R15_G14_KEY_PROFILE_ERROR_SAMPLING_NS={}",
-                        profile.error_sampling_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_UNIFORM_SAMPLING_NS={}",
-                        profile.uniform_sampling_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_RANDOM_NTT_NS={}",
-                        profile.random_ntt_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_MESSAGE_NTT_NS={}",
-                        profile.message_ntt_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_RLWE_ARITHMETIC_NS={}",
-                        profile.rlwe_arithmetic_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_ENCRYPTION_TOTAL_NS={}",
-                        profile.total_ns
-                    );
-
-                    prepared
-                } else {
-                    PreparedBoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
-                        BoundedRnsKeygenConfig {
-                            plaintext_modulus: 2,
-                            layout: left_layout,
-                            plan: stage_plan,
-                        },
-                        secret,
-                        rotation_exponent_left(degree, rotation),
-                        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                        &mut rng,
-                    )
-                };
-                let keygen_ms = keygen_start.elapsed().as_millis();
-                (prepared, keygen_ms, 0)
-            } else {
-                let key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
-                    BoundedRnsKeygenConfig {
-                        plaintext_modulus: 2,
-                        layout: left_layout,
-                        plan: stage_plan,
-                    },
-                    secret,
-                    rotation_exponent_left(degree, rotation),
-                    ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                    &mut rng,
-                );
-                let keygen_ms = keygen_start.elapsed().as_millis();
-                let preparation_start = Instant::now();
-                let prepared = PreparedBoundedRnsGaloisKey::new(&key, stage_plan);
-                drop(key);
-                (prepared, keygen_ms, preparation_start.elapsed().as_millis())
-            }
-        });
-
-        let right_worker = scope.spawn(move || {
-            let mut rng = randomness_mode.rng(0x1531_1101 ^ ((stage_level as u64) << 8));
-
-            let keygen_start = Instant::now();
-
-            if direct_prepared {
-                let prepared = if profile_enabled {
-                    let mut profile = ccmm_rs::grafting::PreparedRlweEncryptionProfile::default();
-
-                    let prepared =
-                        PreparedBoundedRnsGaloisKey::generate_profiled_with_distribution_ntt_rng(
-                            BoundedRnsKeygenConfig {
-                                plaintext_modulus: 2,
-                                layout: right_layout,
-                                plan: stage_plan,
-                            },
-                            secret,
-                            rotation_exponent_right(degree, rotation),
-                            ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                            &mut rng,
-                            &mut profile,
-                        );
-
-                    println!("R15_G14_KEY_PROFILE_DIRECTION=right");
-                    println!("R15_G14_KEY_PROFILE_LEVEL={stage_level}");
-                    println!(
-                        "R15_G14_KEY_PROFILE_ERROR_SAMPLING_NS={}",
-                        profile.error_sampling_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_UNIFORM_SAMPLING_NS={}",
-                        profile.uniform_sampling_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_RANDOM_NTT_NS={}",
-                        profile.random_ntt_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_MESSAGE_NTT_NS={}",
-                        profile.message_ntt_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_RLWE_ARITHMETIC_NS={}",
-                        profile.rlwe_arithmetic_ns
-                    );
-                    println!(
-                        "R15_G14_KEY_PROFILE_ENCRYPTION_TOTAL_NS={}",
-                        profile.total_ns
-                    );
-
-                    prepared
-                } else {
-                    PreparedBoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
-                        BoundedRnsKeygenConfig {
-                            plaintext_modulus: 2,
-                            layout: right_layout,
-                            plan: stage_plan,
-                        },
-                        secret,
-                        rotation_exponent_right(degree, rotation),
-                        ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                        &mut rng,
-                    )
-                };
-                let keygen_ms = keygen_start.elapsed().as_millis();
-                (prepared, keygen_ms, 0)
-            } else {
-                let key = BoundedRnsGaloisKey::generate_with_distribution_ntt_rng(
-                    BoundedRnsKeygenConfig {
-                        plaintext_modulus: 2,
-                        layout: right_layout,
-                        plan: stage_plan,
-                    },
-                    secret,
-                    rotation_exponent_right(degree, rotation),
-                    ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                    &mut rng,
-                );
-                let keygen_ms = keygen_start.elapsed().as_millis();
-                let preparation_start = Instant::now();
-                let prepared = PreparedBoundedRnsGaloisKey::new(&key, stage_plan);
-                drop(key);
-                (prepared, keygen_ms, preparation_start.elapsed().as_millis())
-            }
-        });
-
-        (
-            left_worker
-                .join()
-                .expect("R15-G12 left key worker panicked"),
-            right_worker
-                .join()
-                .expect("R15-G12 right key worker panicked"),
-        )
-    });
-
-    let key_pipeline_wall_ms = key_pipeline_start.elapsed().as_millis();
-
-    println!("R15_G12_KEY_PIPELINE_WALL_MS={key_pipeline_wall_ms}");
-    println!("R15_G12_KEY_PIPELINE_MODE=parallel_left_right");
-    println!(
-        "R15_G13B_KEY_PIPELINE_MODE={}",
-        if direct_prepared {
-            "direct_prepared"
-        } else {
-            "reference"
-        }
-    );
-
-    let preparation_start = Instant::now();
-
-    let prepared_fft_stages: Vec<_> = values
-        .iter()
-        .map(|input| {
-            PreparedRepeatedPackedFft2DifStage::new(
-                input, diagonals, 1, embedding, chain, stage_plan,
-            )
-        })
-        .collect();
-
-    let diagonal_preparation_ms = preparation_start.elapsed().as_millis();
-
-    let execution_start = Instant::now();
-
-    let outputs: Vec<RnsCkksCiphertext> = values
-        .iter()
-        .zip(prepared_fft_stages.iter())
-        .map(|(input, prepared_fft_stage)| {
-            execute_repeated_packed_fft2_dif_stage_cp_bounded_prepared(
-                input,
-                prepared_fft_stage,
-                evaluator,
-                (&prepared_left, &prepared_right),
-                chain,
-                stage_plan,
-                &prepared_plan,
-            )
-        })
-        .collect();
-
-    let execution_ms = execution_start.elapsed().as_millis();
-
-    assert!(
-        outputs
-            .iter()
-            .all(|output| output.level() == stage_level + 1),
-        "bounded Gaussian FFT stage produced an unexpected ciphertext level"
-    );
-
-    println!("R15_G11_STAGE_LEFT_KEYGEN_MS={left_keygen_ms}");
-    println!("R15_G11_STAGE_LEFT_PREPARATION_MS={left_preparation_ms}");
-    println!("R15_G11_STAGE_RIGHT_KEYGEN_MS={right_keygen_ms}");
-    println!("R15_G11_STAGE_RIGHT_PREPARATION_MS={right_preparation_ms}");
-    println!("R15_G11_STAGE_DIAGONAL_PREPARATION_MS={diagonal_preparation_ms}");
-    println!("R15_G11_STAGE_EXECUTION_MS={execution_ms}");
-    println!(
-        "R15_G11_STAGE_DONE level={stage_level} output_level={} scale={:.12e}",
-        outputs[0].level(),
-        outputs[0].scale()
     );
 
     outputs
@@ -541,27 +244,6 @@ fn complex_payload_bytes(elements: usize) -> usize {
     elements
         .checked_mul(std::mem::size_of::<Complex64>())
         .expect("complex payload byte count overflow")
-}
-
-fn galois_key_payload_estimate_bytes(
-    degree: usize,
-    active_limbs: usize,
-    key_count: usize,
-) -> usize {
-    /*
-     * Singleton gadget decomposition:
-     *
-     * each Galois key contains one RLWE key-switch ciphertext per
-     * decomposition block. With singleton blocks there are `active_limbs`
-     * blocks, each containing two RNS polynomials over the active basis.
-     *
-     * This is the cryptographic coefficient payload, not allocator/container
-     * overhead. Peak RSS is measured independently at the OS level.
-     */
-    key_count
-        .checked_mul(active_limbs)
-        .and_then(|value| value.checked_mul(ciphertext_payload_bytes(degree, active_limbs)))
-        .expect("Galois-key payload estimate overflow")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -807,10 +489,6 @@ fn fft_stage_done(level: usize, kind: &str, span: usize, tile_count: usize, star
     std::io::stdout()
         .flush()
         .expect("FFT stage progress output must flush");
-}
-
-fn block_sizes(limb_count: usize) -> Vec<usize> {
-    vec![1; limb_count]
 }
 
 fn bit_reverse(index: usize, length: usize) -> usize {
@@ -1350,51 +1028,6 @@ fn fft_shift(values: &[Complex64], shape: Fft2Shape) -> Vec<Complex64> {
     shifted
 }
 
-fn execute_fft_stage_r17_4h(
-    input: &ccmm_rs::ckks::RnsCkksCiphertext,
-    prepared_fft_stage: &ccmm_rs::eblas::fft::PreparedRepeatedPackedFft2DifStage,
-    evaluator: &ccmm_rs::ckks::RnsCkksEvaluator<'_>,
-    prepared_galois_keys: (
-        &ccmm_rs::ckks::PreparedRnsGaloisKey,
-        &ccmm_rs::ckks::PreparedRnsGaloisKey,
-    ),
-    chain: &ccmm_rs::ring::ModulusChain,
-    plan: &ccmm_rs::ring::RnsNttPlan,
-    prepared_plan: &ccmm_rs::ring::PreparedRnsNttPlan,
-) -> ccmm_rs::ckks::RnsCkksCiphertext {
-    if std::env::var("FHE_FFT_LEGACY_PREPARED").as_deref() == Ok("1") {
-        ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_cp_prepared(
-            input,
-            prepared_fft_stage,
-            evaluator,
-            prepared_galois_keys,
-            chain,
-            plan,
-            prepared_plan,
-        )
-    } else if std::env::var("FHE_FFT_SHARED_B_NTT").as_deref() == Ok("1") {
-        ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident_shared_b(
-            input,
-            prepared_fft_stage,
-            evaluator,
-            prepared_galois_keys,
-            chain,
-            plan,
-            prepared_plan,
-        )
-    } else {
-        ccmm_rs::eblas::fft::execute_repeated_packed_fft2_dif_stage_cp_prepared_ntt_resident(
-            input,
-            prepared_fft_stage,
-            evaluator,
-            prepared_galois_keys,
-            chain,
-            plan,
-            prepared_plan,
-        )
-    }
-}
-
 fn main() {
     let input_path = env::args().nth(1).map(PathBuf::from).expect(
         "usage: cargo run --release --bin ckks_encrypted_image_fft -- <input-image> [dimension]",
@@ -1524,20 +1157,8 @@ fn main() {
 
     assert!(!local_profile.security_bearing());
     assert!(!profile.security_bearing());
-    let galois_key_mode = FftGaloisKeyMode::from_environment();
+    validate_fft_galois_key_mode();
     let randomness_mode = FftRandomnessMode::from_environment();
-
-    assert!(
-        galois_key_mode != FftGaloisKeyMode::Baseline,
-        "zero-noise FFT Galois keys are unsupported; use Gaussian hybrid execution"
-    );
-
-    if randomness_mode == FftRandomnessMode::Secure {
-        assert!(
-            galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect,
-            "secure randomness mode requires bounded_gaussian_direct Galois keys"
-        );
-    }
 
     println!("FFT_RANDOMNESS_MODE={}", randomness_mode.label());
     println!(
@@ -1575,24 +1196,10 @@ fn main() {
     println!("FFT_INITIAL_SCALE={scale:.12e}");
     println!("FFT_ENCRYPTION_SIGMA={SIGMA:.6}");
 
-    println!("FFT_GALOIS_KEY_MODE={}", galois_key_mode.label());
-    println!(
-        "FFT_GALOIS_KEY_ERROR_DISTRIBUTION={}",
-        match galois_key_mode {
-            FftGaloisKeyMode::Baseline => "zero",
-            FftGaloisKeyMode::Gaussian
-            | FftGaloisKeyMode::BoundedGaussian
-            | FftGaloisKeyMode::BoundedGaussianDirect => "discrete_gaussian",
-        }
-    );
-    if matches!(
-        galois_key_mode,
-        FftGaloisKeyMode::Gaussian
-            | FftGaloisKeyMode::BoundedGaussian
-            | FftGaloisKeyMode::BoundedGaussianDirect
-    ) {
-        println!("FFT_GALOIS_KEY_SIGMA={SIGMA:.6}");
-    }
+    println!("FFT_GALOIS_KEY_MODE=hybrid_gaussian");
+    println!("FFT_GALOIS_KEY_ERROR_DISTRIBUTION=discrete_gaussian");
+    println!("FFT_GALOIS_KEY_SIGMA={SIGMA:.6}");
+
     println!("FFT_PLAINTEXT_MODULUS=2");
     println!("FFT_GADGET_BLOCK_POLICY=singleton");
     println!("FFT_DIRECTION=forward");
@@ -2019,20 +1626,7 @@ fn main() {
         .checked_mul(2)
         .expect("Galois-key count overflow");
 
-    let mut galois_key_payload_estimate_bytes_total = 0usize;
-
-    for &(key_level, _) in &level_rotations {
-        let limbs = chain.level(key_level).moduli().len();
-
-        galois_key_payload_estimate_bytes_total = galois_key_payload_estimate_bytes_total
-            .checked_add(galois_key_payload_estimate_bytes(degree, limbs, 2))
-            .expect("total Galois-key payload estimate overflow");
-    }
-
     println!("FFT_RESOURCE_GALOIS_KEY_COUNT={galois_key_count}");
-    println!(
-        "FFT_RESOURCE_GALOIS_KEY_PAYLOAD_ESTIMATE_BYTES={galois_key_payload_estimate_bytes_total}"
-    );
 
     println!("FHE_FFT_ROTATION_KEY_SCHEDULE_BEGIN");
     for &(key_level, key_rotation) in &level_rotations {
@@ -2040,158 +1634,9 @@ fn main() {
     }
     println!("FHE_FFT_ROTATION_KEY_SCHEDULE_END");
 
-    let mut evaluation_keys = RnsCkksEvaluationKeys::new();
-    let mut timing_galois_ms = vec![0_u128; level_rotations.len()];
-
-    if !matches!(
-        galois_key_mode,
-        FftGaloisKeyMode::BoundedGaussian | FftGaloisKeyMode::BoundedGaussianDirect
-    ) {
-        for (phase_offset, &(level, rotation)) in level_rotations.iter().enumerate() {
-            let phase_index = phase_offset + 2;
-            let phase_name = format!("level-{level} Galois keygen");
-            let keygen_start = phase_start(phase_index, total_phases, &phase_name);
-
-            let level_basis = chain.level(level).clone();
-            let level_layout =
-                RnsGadgetLayout::new(level_basis.clone(), block_sizes(level_basis.len()));
-            let level_plan = RnsNttPlan::new(level_basis.moduli().to_vec(), degree);
-
-            println!(
-                "FFT_GALOIS_LEVEL level={level} rotation={rotation} limbs={} degree={degree}",
-                level_layout.full_basis().len()
-            );
-            io::stdout()
-                .flush()
-                .expect("Galois-level parameterization output must flush");
-
-            let mut level_keys = RnsCkksLevelKeys::new(level, level_basis);
-
-            let left_exponent = rotation_exponent_left(degree, rotation);
-            let right_exponent = rotation_exponent_right(degree, rotation);
-
-            println!(
-            "      level={level} rotation={rotation} direction=left exponent={left_exponent} ... START"
-        );
-            println!(
-            "      level={level} rotation={rotation} direction=right exponent={right_exponent} ... START"
-        );
-            io::stdout()
-                .flush()
-                .expect("Galois-key progress output must flush");
-
-            let ((left_key, left_ms), (right_key, right_ms)) = std::thread::scope(|scope| {
-                let left_handle = scope.spawn(|| {
-                    let start = Instant::now();
-                    let mut rng =
-                        randomness_mode.rng(0x4652_4551_4649_4d00 ^ ((level as u64) << 8));
-
-                    let config = RnsKeygenConfig {
-                        degree,
-                        plaintext_modulus: 2,
-                        noise_bound: 0,
-                        layout: level_layout.clone(),
-                        plan: &level_plan,
-                    };
-
-                    let key = match galois_key_mode {
-                        FftGaloisKeyMode::BoundedGaussianDirect => {
-                            unreachable!(
-                                "direct prepared Gaussian keys must use the bounded FFT stage helper"
-                            )
-                        },
-
-                        FftGaloisKeyMode::Baseline => RnsGaloisKey::generate_with_ntt_rng(
-                            config,
-                            &secret,
-                            left_exponent,
-                            &mut rng,
-                        ),
-                        FftGaloisKeyMode::Gaussian => {
-                            RnsGaloisKey::generate_with_distribution_ntt_rng(
-                                config,
-                                &secret,
-                                left_exponent,
-                                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                                &mut rng,
-                            )
-                        }
-                        FftGaloisKeyMode::BoundedGaussian => {
-                            unreachable!("bounded keys are generated per stage")
-                        }
-                    };
-
-                    (key, start.elapsed().as_millis())
-                });
-
-                let right_handle = scope.spawn(|| {
-                    let start = Instant::now();
-                    let mut rng = randomness_mode.rng(0x4652_4551_4649_4d00 ^ ((level as u64) << 8) ^ 1_u64);
-
-                    let config = RnsKeygenConfig {
-                        degree,
-                        plaintext_modulus: 2,
-                        noise_bound: 0,
-                        layout: level_layout.clone(),
-                        plan: &level_plan,
-                    };
-
-                    let key = match galois_key_mode {
-                        FftGaloisKeyMode::BoundedGaussianDirect => {
-                            unreachable!(
-                                "direct prepared Gaussian keys must use the bounded FFT stage helper"
-                            )
-                        },
-
-                        FftGaloisKeyMode::Baseline => RnsGaloisKey::generate_with_ntt_rng(
-                            config,
-                            &secret,
-                            right_exponent,
-                            &mut rng,
-                        ),
-                        FftGaloisKeyMode::Gaussian => {
-                            RnsGaloisKey::generate_with_distribution_ntt_rng(
-                                config,
-                                &secret,
-                                right_exponent,
-                                ErrorDistribution::DiscreteGaussian { sigma: SIGMA },
-                                &mut rng,
-                            )
-                        }
-                        FftGaloisKeyMode::BoundedGaussian => {
-                            unreachable!("bounded keys are generated per stage")
-                        }
-                    };
-
-                    (key, start.elapsed().as_millis())
-                });
-
-                (
-                    left_handle
-                        .join()
-                        .expect("left Galois-key generation worker panicked"),
-                    right_handle
-                        .join()
-                        .expect("right Galois-key generation worker panicked"),
-                )
-            });
-
-            println!(
-            "      level={level} rotation={rotation} direction=left exponent={left_exponent} ... DONE elapsed_ms={left_ms}"
-        );
-            println!(
-            "      level={level} rotation={rotation} direction=right exponent={right_exponent} ... DONE elapsed_ms={right_ms}"
-        );
-
-            level_keys.insert_galois_key(left_key);
-            level_keys.insert_galois_key(right_key);
-
-            evaluation_keys.insert_level(level_keys);
-
-            timing_galois_ms[phase_offset] =
-                phase_done(phase_index, total_phases, &phase_name, keygen_start);
-        }
-    }
+    // Hybrid rotation keys are generated and owned by each
+    // local FFT stage. Global stages require no rotation keys.
+    let evaluation_keys = RnsCkksEvaluationKeys::new();
 
     let evaluator = RnsCkksEvaluator::new(&chain, &evaluation_keys);
 
@@ -2372,117 +1817,16 @@ fn main() {
 
         let stage_plan = RnsNttPlan::new(chain.level(execution_level).moduli().to_vec(), degree);
 
-        let rotation = diagonals.rotation();
-        let left_exponent = rotation_exponent_left(degree, rotation);
-        let right_exponent = rotation_exponent_right(degree, rotation);
-
-        if matches!(
-            galois_key_mode,
-            FftGaloisKeyMode::BoundedGaussian | FftGaloisKeyMode::BoundedGaussianDirect
-        ) {
-            values = if galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect {
-                execute_gaussian_hybrid_local_stage(
-                    randomness_mode,
-                    &values,
-                    &diagonals,
-                    &evaluator,
-                    &secret,
-                    &embedding,
-                    &chain,
-                    &stage_plan,
-                )
-            } else {
-                execute_bounded_gaussian_local_stage(
-                    randomness_mode,
-                    false,
-                    &values,
-                    &diagonals,
-                    &evaluator,
-                    &secret,
-                    &embedding,
-                    &chain,
-                    &stage_plan,
-                )
-            };
-        } else {
-            let stage_state = values
-                .first()
-                .expect("local-row FFT stage requires at least one encrypted tile")
-                .state();
-
-            let prepared_left = PreparedRnsGaloisKey::new(
-                evaluator.keys().galois_for(stage_state, left_exponent),
-                &stage_plan,
-            );
-
-            let prepared_right = PreparedRnsGaloisKey::new(
-                evaluator.keys().galois_for(stage_state, right_exponent),
-                &stage_plan,
-            );
-
-            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
-                values.first().expect("FFT stage requires encrypted tiles"),
-                &diagonals,
-                1,
-                &embedding,
-                &chain,
-                &stage_plan,
-            );
-            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
-
-            let mut stage_results = Vec::with_capacity(tile_count);
-
-            for batch_start in (0..tile_count).step_by(fft_local_tile_workers()) {
-                let batch_end = (batch_start + fft_local_tile_workers()).min(tile_count);
-
-                let batch = std::thread::scope(|scope| {
-                    let mut workers = Vec::with_capacity(batch_end - batch_start);
-
-                    for (tile_index, value) in
-                        values.iter().enumerate().take(batch_end).skip(batch_start)
-                    {
-                        let evaluator = &evaluator;
-                        let prepared_left = &prepared_left;
-                        let prepared_right = &prepared_right;
-                        let prepared_fft_stage = &prepared_fft_stage;
-                        let chain = &chain;
-                        let stage_plan = &stage_plan;
-                        let prepared_plan = &prepared_plan;
-
-                        workers.push((
-                            tile_index,
-                            scope.spawn(move || {
-                                execute_fft_stage_r17_4h(
-                                    value,
-                                    prepared_fft_stage,
-                                    evaluator,
-                                    (prepared_left, prepared_right),
-                                    chain,
-                                    stage_plan,
-                                    prepared_plan,
-                                )
-                            }),
-                        ));
-                    }
-
-                    workers
-                        .into_iter()
-                        .map(|(tile_index, worker)| {
-                            (
-                                tile_index,
-                                worker.join().expect("local FFT tile worker panicked"),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
-
-                stage_results.extend(batch);
-            }
-
-            stage_results.sort_by_key(|(tile_index, _)| *tile_index);
-
-            values = stage_results.into_iter().map(|(_, value)| value).collect();
-        }
+        values = execute_gaussian_hybrid_local_stage(
+            randomness_mode,
+            &values,
+            &diagonals,
+            &evaluator,
+            &secret,
+            &embedding,
+            &chain,
+            &stage_plan,
+        );
 
         execution_level += 1;
         maybe_check_stage!();
@@ -2650,117 +1994,16 @@ fn main() {
 
         let stage_plan = RnsNttPlan::new(chain.level(execution_level).moduli().to_vec(), degree);
 
-        let rotation = diagonals.rotation();
-        let left_exponent = rotation_exponent_left(degree, rotation);
-        let right_exponent = rotation_exponent_right(degree, rotation);
-
-        if matches!(
-            galois_key_mode,
-            FftGaloisKeyMode::BoundedGaussian | FftGaloisKeyMode::BoundedGaussianDirect
-        ) {
-            values = if galois_key_mode == FftGaloisKeyMode::BoundedGaussianDirect {
-                execute_gaussian_hybrid_local_stage(
-                    randomness_mode,
-                    &values,
-                    &diagonals,
-                    &evaluator,
-                    &secret,
-                    &embedding,
-                    &chain,
-                    &stage_plan,
-                )
-            } else {
-                execute_bounded_gaussian_local_stage(
-                    randomness_mode,
-                    false,
-                    &values,
-                    &diagonals,
-                    &evaluator,
-                    &secret,
-                    &embedding,
-                    &chain,
-                    &stage_plan,
-                )
-            };
-        } else {
-            let stage_state = values
-                .first()
-                .expect("local-column FFT stage requires at least one encrypted tile")
-                .state();
-
-            let prepared_left = PreparedRnsGaloisKey::new(
-                evaluator.keys().galois_for(stage_state, left_exponent),
-                &stage_plan,
-            );
-
-            let prepared_right = PreparedRnsGaloisKey::new(
-                evaluator.keys().galois_for(stage_state, right_exponent),
-                &stage_plan,
-            );
-
-            let prepared_fft_stage = PreparedRepeatedPackedFft2DifStage::new(
-                values.first().expect("FFT stage requires encrypted tiles"),
-                &diagonals,
-                1,
-                &embedding,
-                &chain,
-                &stage_plan,
-            );
-            let prepared_plan = PreparedRnsNttPlan::new(&stage_plan);
-
-            let mut stage_results = Vec::with_capacity(tile_count);
-
-            for batch_start in (0..tile_count).step_by(fft_local_tile_workers()) {
-                let batch_end = (batch_start + fft_local_tile_workers()).min(tile_count);
-
-                let batch = std::thread::scope(|scope| {
-                    let mut workers = Vec::with_capacity(batch_end - batch_start);
-
-                    for (tile_index, value) in
-                        values.iter().enumerate().take(batch_end).skip(batch_start)
-                    {
-                        let evaluator = &evaluator;
-                        let prepared_left = &prepared_left;
-                        let prepared_right = &prepared_right;
-                        let prepared_fft_stage = &prepared_fft_stage;
-                        let chain = &chain;
-                        let stage_plan = &stage_plan;
-                        let prepared_plan = &prepared_plan;
-
-                        workers.push((
-                            tile_index,
-                            scope.spawn(move || {
-                                execute_fft_stage_r17_4h(
-                                    value,
-                                    prepared_fft_stage,
-                                    evaluator,
-                                    (prepared_left, prepared_right),
-                                    chain,
-                                    stage_plan,
-                                    prepared_plan,
-                                )
-                            }),
-                        ));
-                    }
-
-                    workers
-                        .into_iter()
-                        .map(|(tile_index, worker)| {
-                            (
-                                tile_index,
-                                worker.join().expect("local FFT tile worker panicked"),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
-
-                stage_results.extend(batch);
-            }
-
-            stage_results.sort_by_key(|(tile_index, _)| *tile_index);
-
-            values = stage_results.into_iter().map(|(_, value)| value).collect();
-        }
+        values = execute_gaussian_hybrid_local_stage(
+            randomness_mode,
+            &values,
+            &diagonals,
+            &evaluator,
+            &secret,
+            &embedding,
+            &chain,
+            &stage_plan,
+        );
 
         execution_level += 1;
         maybe_check_stage!();
@@ -2917,10 +2160,6 @@ fn main() {
 
     println!("FFT_TIMING_ENCRYPTION_MS={timing_encryption_ms}");
 
-    for (index, elapsed_ms) in timing_galois_ms.iter().enumerate() {
-        println!("FFT_TIMING_GALOIS_KEY_{index}_MS={elapsed_ms}");
-    }
-
     println!("FFT_TIMING_FORWARD_FFT2_MS={timing_forward_fft2_ms}");
     println!("FFT_TIMING_DECRYPT_DECODE_MS={timing_decrypt_decode_ms}");
     println!("FFT_TIMING_TOTAL_MS={timing_total_ms}");
@@ -2933,14 +2172,11 @@ fn main() {
         0.0
     };
 
-    let timing_galois_total_ms: u128 = timing_galois_ms.iter().copied().sum();
-
     println!("FFT_METRIC_ENCRYPTED_FFT2_MS={timing_forward_fft2_ms}");
     println!("FFT_METRIC_ENCRYPTED_FFT2_SECONDS={encrypted_fft2_seconds:.6}");
     println!(
         "FFT_METRIC_ENCRYPTED_FFT2_ELEMENTS_PER_SECOND={encrypted_fft2_elements_per_second:.6}"
     );
-    println!("FFT_METRIC_GALOIS_KEYGEN_TOTAL_MS={timing_galois_total_ms}");
     println!("FFT_METRIC_ENCRYPTION_MS={timing_encryption_ms}");
     println!("FFT_METRIC_DECRYPT_DECODE_MS={timing_decrypt_decode_ms}");
     println!("FFT_METRIC_END_TO_END_MS={timing_total_ms}");
